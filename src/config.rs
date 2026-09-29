@@ -18,6 +18,8 @@ pub struct Config {
     pub keys: BTreeMap<String, String>,
     /// Show dotfiles from the start.
     pub show_hidden: bool,
+    /// Percent of the screen width the folder columns may use. The file preview gets the rest.
+    pub tree_width: u8,
 }
 
 impl Default for Config {
@@ -26,6 +28,7 @@ impl Default for Config {
             editors: DEFAULT_EDITORS.map(String::from).to_vec(),
             keys: BTreeMap::new(),
             show_hidden: false,
+            tree_width: 50,
         }
     }
 }
@@ -36,6 +39,7 @@ struct Raw {
     editor: Option<OneOrMany>,
     keys: Option<BTreeMap<String, String>>,
     show_hidden: Option<bool>,
+    tree_width: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +79,15 @@ impl Config {
             editors,
             keys: raw.keys.unwrap_or_default(),
             show_hidden: raw.show_hidden.unwrap_or(false),
+            tree_width: match raw.tree_width {
+                None => 50,
+                Some(percent @ 20..=100) => percent,
+                Some(_) => {
+                    return Err(serde::de::Error::custom(
+                        "tree_width is a percent of the screen, from 20 to 100",
+                    ));
+                }
+            },
         })
     }
 
@@ -147,6 +160,15 @@ mod tests {
         assert_eq!(config.keys["gg"], "first");
         assert_eq!(config.keys["q"], "none");
         assert_eq!(config.editors, Config::default().editors);
+    }
+
+    #[test]
+    fn tree_width_is_a_percent_between_20_and_100() {
+        assert_eq!(Config::parse("").unwrap().tree_width, 50);
+        assert_eq!(Config::parse("tree_width = 35").unwrap().tree_width, 35);
+        assert!(Config::parse("tree_width = 10").is_err());
+        assert!(Config::parse("tree_width = 150").is_err());
+        assert!(Config::parse("tree_width = 300").is_err());
     }
 
     #[test]

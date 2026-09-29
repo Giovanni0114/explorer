@@ -44,6 +44,7 @@ fn main() -> io::Result<()> {
     });
     let settings = Settings {
         show_hidden: config.show_hidden,
+        tree_width: config.tree_width,
         marks: Marks::open(Marks::default_file()),
         trash: std::sync::Arc::new(SystemTrash),
     };

@@ -9,7 +9,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{App, OverlayView},
-    layout::{self, Col, Placed},
+    layout::{self, Placed},
     model::{Entry, FilePreview, Kind, Level, Load, PreviewState},
     preview::{Content, Span},
     theme::{self, BG, DIM, FG},
@@ -48,13 +48,9 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     let levels = app.tree().levels();
     let editor = app.editor();
     let preview = app.tree().preview().filter(|_| editor.is_none());
-    let mut cols: Vec<Col> = levels
-        .iter()
-        .map(|l| Col::rigid(natural_width(l)))
-        .collect();
-    cols.extend(preview.map(preview_col));
-    cols.extend(editor.map(editor_col));
-    let placed = layout::place_columns(&cols, tree.width, focus);
+    let widths: Vec<u16> = levels.iter().map(natural_width).collect();
+    let content = editor.is_some() || preview.is_some();
+    let placed = layout::place(&widths, content, tree.width, focus, app.tree_width());
 
     for p in &placed {
         if p.level >= levels.len() {
@@ -305,10 +301,6 @@ fn fill(buf: &mut Buffer, area: Rect, style: Style) {
     }
 }
 
-const PREVIEW_MIN_WIDTH: u16 = 24;
-const PREVIEW_MAX_WIDTH: u16 = 100;
-const PREVIEW_MEASURED_LINES: usize = 200;
-
 fn preview_color(preview: &FilePreview) -> (u8, u8, u8) {
     theme::level_color(preview.path.components().count())
 }
@@ -325,26 +317,6 @@ fn gutter_width(content: &Content) -> u16 {
         return 0;
     }
     content.lines.len().to_string().len().max(2) as u16 + 1
-}
-
-fn preview_col(preview: &FilePreview) -> Col {
-    let natural = match &preview.state {
-        PreviewState::Ready(content) => {
-            let longest = content
-                .lines
-                .iter()
-                .take(PREVIEW_MEASURED_LINES)
-                .map(|l| l.0.iter().map(|s| s.text.width()).sum::<usize>())
-                .max()
-                .unwrap_or(0) as u16;
-            (longest + gutter_width(content) + 2).clamp(30, PREVIEW_MAX_WIDTH)
-        }
-        _ => 30,
-    };
-    Col {
-        natural,
-        min: PREVIEW_MIN_WIDTH.min(natural),
-    }
 }
 
 fn draw_preview(buf: &mut Buffer, tree: Rect, center: u16, p: Placed, preview: &FilePreview) {
@@ -417,18 +389,6 @@ fn editor_color(editor: &crate::editor::Editor) -> (u8, u8, u8) {
 
 fn editor_gutter(editor: &crate::editor::Editor) -> u16 {
     editor.line_count().to_string().len().max(2) as u16 + 1
-}
-
-fn editor_col(editor: &crate::editor::Editor) -> Col {
-    let longest = (0..editor.line_count().min(PREVIEW_MEASURED_LINES))
-        .map(|i| crate::editor::display_col(editor.line_text(i), usize::MAX))
-        .max()
-        .unwrap_or(0) as u16;
-    let natural = (longest + editor_gutter(editor) + 3).clamp(40, PREVIEW_MAX_WIDTH);
-    Col {
-        natural,
-        min: PREVIEW_MIN_WIDTH,
-    }
 }
 
 /// The file being edited, with line numbers, syntax colors and a block cursor. Long lines scroll
@@ -771,7 +731,7 @@ mod tests {
     fn selected_entries_of_all_levels_share_one_row_joined_by_a_brace() {
         let tmp = fixture();
         let app = open(tmp.path());
-        let (lines, _) = rows(&app, 60, 11);
+        let (lines, _) = rows(&app, 100, 11);
         // tree area is rows 1..10, center row is 1 + 9 / 2 = 5
         let center = &lines[5];
         assert!(center.contains("alpha/"), "{center:?}");
@@ -803,7 +763,7 @@ mod tests {
         let tmp = fixture();
         let mut app = open(tmp.path());
         keys(&mut app, "j");
-        let (lines, _) = rows(&app, 60, 11);
+        let (lines, _) = rows(&app, 100, 11);
         assert!(lines[5].contains("beta/"), "{:?}", lines[5]);
         assert!(lines[4].contains("alpha/"), "{:?}", lines[4]);
         assert!(lines.iter().all(|l| !l.contains("one.txt")), "{lines:#?}");
@@ -814,7 +774,7 @@ mod tests {
     fn levels_are_colored_by_depth_and_cursor_row_is_filled() {
         let tmp = fixture();
         let app = open(tmp.path());
-        let (lines, buf) = rows(&app, 60, 11);
+        let (lines, buf) = rows(&app, 100, 11);
         let x = lines[5].find("alpha/").unwrap();
         let x = lines[5][..x].chars().count() as u16;
         let depth = tmp.path().components().count();
@@ -863,7 +823,7 @@ mod tests {
             !center.contains("aaaaaaaaaaaa/"),
             "ancestors that do not fit scroll off: {center:?}"
         );
-        let (wide, _) = rows(&app, 70, 9);
+        let (wide, _) = rows(&app, 140, 9);
         assert!(
             wide[4].contains("eeeeeeeeeeee/"),
             "the parent returns once it fits: {:?}",
@@ -876,7 +836,7 @@ mod tests {
     fn the_first_column_is_flush_left() {
         let tmp = fixture();
         let app = open(tmp.path());
-        let (lines, buf) = rows(&app, 60, 11);
+        let (lines, buf) = rows(&app, 100, 11);
         assert!(lines[5].starts_with(" alpha/"), "{:?}", lines[5]);
         assert_ne!(
             buf[(0, 5)].bg,
@@ -889,7 +849,7 @@ mod tests {
     fn a_pending_listing_renders_blank_instead_of_flashing_a_label() {
         let tmp = fixture();
         let app = App::new(tmp.path().to_path_buf(), Keymap::default());
-        let (lines, _) = rows(&app, 60, 11);
+        let (lines, _) = rows(&app, 100, 11);
         assert!(lines[5].trim().is_empty(), "{:?}", lines[5]);
     }
 
@@ -902,7 +862,7 @@ mod tests {
         let tmp = fixture();
         let mut app = open(tmp.path());
         keys(&mut app, "/file");
-        let (lines, _) = rows(&app, 60, 11);
+        let (lines, _) = rows(&app, 100, 11);
         assert_eq!(footer(&lines), "/file");
         assert!(
             lines[5].contains("file.md"),
@@ -916,7 +876,7 @@ mod tests {
         let tmp = fixture();
         let mut app = open(tmp.path());
         keys(&mut app, "/zzz<cr>");
-        let (lines, _) = rows(&app, 60, 11);
+        let (lines, _) = rows(&app, 100, 11);
         assert_eq!(footer(&lines), "pattern not found: zzz");
     }
 
@@ -925,7 +885,7 @@ mod tests {
         let tmp = fixture();
         let mut app = open(tmp.path());
         keys(&mut app, "/ab<left>");
-        let (lines, buf) = rows(&app, 60, 11);
+        let (lines, buf) = rows(&app, 100, 11);
         assert_eq!(footer(&lines), "/ab");
         assert!(
             buf[(3, 10)].modifier.contains(Modifier::REVERSED),
@@ -933,7 +893,7 @@ mod tests {
         );
         assert!(!buf[(2, 10)].modifier.contains(Modifier::REVERSED));
         keys(&mut app, "<end>");
-        let (_, buf) = rows(&app, 60, 11);
+        let (_, buf) = rows(&app, 100, 11);
         assert!(
             buf[(4, 10)].modifier.contains(Modifier::REVERSED),
             "cursor sits past the end"
@@ -945,7 +905,7 @@ mod tests {
         let tmp = fixture();
         let mut app = open(tmp.path());
         keys(&mut app, "12g");
-        let (lines, _) = rows(&app, 60, 11);
+        let (lines, _) = rows(&app, 100, 11);
         assert!(lines[10].trim_end().ends_with("12g"), "{:?}", lines[10]);
     }
 
@@ -1054,14 +1014,14 @@ mod tests {
         let mut app = open(tmp.path());
         keys(&mut app, "l");
         keys(&mut app, "G");
-        let (lines, _) = rows(&app, 70, 11);
+        let (lines, _) = rows(&app, 100, 11);
         assert!(lines[5].contains("wide.txt"), "{:?}", lines[5]);
         assert!(
             lines[5].contains("alpha/"),
             "parent column is kept: {:?}",
             lines[5]
         );
-        assert!(lines.iter().all(|l| l.chars().count() == 70));
+        assert!(lines.iter().all(|l| l.chars().count() == 100));
     }
 
     #[test]
@@ -1291,5 +1251,29 @@ mod tests {
         for (w, h) in [(1, 1), (5, 3), (12, 4), (30, 6), (200, 60)] {
             rows(&app, w, h);
         }
+    }
+
+    #[test]
+    fn the_tree_keeps_to_its_share_of_the_width_and_the_preview_fills_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp
+            .path()
+            .join("aaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbb/cccccccccccccccccc");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("file.txt"), "x".repeat(200)).unwrap();
+        let mut app = open(tmp.path());
+        keys(&mut app, "lll");
+        let (lines, _) = rows(&app, 120, 9);
+        let center = &lines[4];
+        assert!(center.contains("file.txt"), "{center:?}");
+        let tip = center.find("───").unwrap();
+        assert!(
+            center[..tip].chars().count() <= 60 + 3,
+            "folders stay in the left half: {center:?}"
+        );
+        assert!(
+            center.trim_end().chars().count() >= 115,
+            "the preview reaches the right edge: {center:?}"
+        );
     }
 }

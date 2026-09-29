@@ -70,6 +70,8 @@ pub struct OverlayView<'a> {
 /// Startup choices that are not key bindings.
 pub struct Settings {
     pub show_hidden: bool,
+    /// Percent of the width the folder columns may use.
+    pub tree_width: u8,
     pub marks: Marks,
     pub trash: Arc<dyn Trasher>,
 }
@@ -78,6 +80,7 @@ impl Default for Settings {
     fn default() -> Settings {
         Settings {
             show_hidden: false,
+            tree_width: 50,
             marks: Marks::default(),
             trash: Arc::new(NoTrash),
         }
@@ -107,6 +110,7 @@ pub struct App {
     pending_focus: Option<PathBuf>,
     /// Where the last jump started, for `''`.
     previous: Option<PathBuf>,
+    tree_width: u8,
     /// Rows available to the tree, for page-sized motions.
     viewport: u16,
     home: Option<PathBuf>,
@@ -132,6 +136,7 @@ impl App {
             files: FileOps::new(settings.trash),
             pending_focus: None,
             previous: None,
+            tree_width: settings.tree_width,
             viewport: 24,
             home: std::env::var_os("HOME").map(PathBuf::from),
             message: None,
@@ -155,6 +160,10 @@ impl App {
         if let Mode::Edit(editor) = &mut self.mode {
             editor.set_rows(usize::from(rows));
         }
+    }
+
+    pub fn tree_width(&self) -> u8 {
+        self.tree_width
     }
 
     pub fn editor(&self) -> Option<&Editor> {
