@@ -446,17 +446,70 @@ pub fn command_named(name: &str) -> Option<Command> {
     COMMANDS.iter().find(|c| c.name == name).map(|c| c.command)
 }
 
+/// A set of commands the input engine can drive: explorer commands, or the editor's.
+pub trait Cmd: Copy + Eq + std::fmt::Debug {
+    type Op: Copy + Eq + std::fmt::Debug;
+    fn operator(self) -> Option<Self::Op>;
+    fn is_motion(self) -> bool;
+    fn wants_char(self) -> bool;
+}
+
+impl Cmd for Command {
+    type Op = Operator;
+
+    fn operator(self) -> Option<Operator> {
+        Command::operator(self)
+    }
+
+    fn is_motion(self) -> bool {
+        Command::is_motion(self)
+    }
+
+    fn wants_char(self) -> bool {
+        Command::wants_char(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lookup {
-    Exact(Command),
+pub enum Lookup<C = Command> {
+    Exact(C),
     Prefix,
     Unbound,
 }
 
 #[derive(Debug, Clone)]
-pub struct Keymap {
-    bindings: HashMap<Vec<Key>, Command>,
+pub struct Keymap<C = Command> {
+    bindings: HashMap<Vec<Key>, C>,
     prefixes: HashSet<Vec<Key>>,
+}
+
+impl<C: Cmd> Keymap<C> {
+    /// Builds a keymap, refusing bindings where one sequence is the start of another.
+    pub fn from_bindings(bindings: HashMap<Vec<Key>, C>) -> Result<Keymap<C>, String> {
+        let mut prefixes = HashSet::new();
+        for seq in bindings.keys() {
+            for len in 1..seq.len() {
+                let prefix = seq[..len].to_vec();
+                if bindings.contains_key(&prefix) {
+                    return Err(format!(
+                        "{} is bound, so {} can never be typed",
+                        seq_label(&prefix),
+                        seq_label(seq)
+                    ));
+                }
+                prefixes.insert(prefix);
+            }
+        }
+        Ok(Keymap { bindings, prefixes })
+    }
+
+    pub fn lookup(&self, keys: &[Key]) -> Lookup<C> {
+        match self.bindings.get(keys) {
+            Some(&command) => Lookup::Exact(command),
+            None if self.prefixes.contains(keys) => Lookup::Prefix,
+            None => Lookup::Unbound,
+        }
+    }
 }
 
 impl Default for Keymap {
@@ -485,29 +538,7 @@ impl Keymap {
                 bindings.insert(seq, command);
             }
         }
-        let mut prefixes = HashSet::new();
-        for seq in bindings.keys() {
-            for len in 1..seq.len() {
-                let prefix = seq[..len].to_vec();
-                if bindings.contains_key(&prefix) {
-                    return Err(format!(
-                        "{} is bound, so {} can never be typed",
-                        seq_label(&prefix),
-                        seq_label(seq)
-                    ));
-                }
-                prefixes.insert(prefix);
-            }
-        }
-        Ok(Keymap { bindings, prefixes })
-    }
-
-    pub fn lookup(&self, keys: &[Key]) -> Lookup {
-        match self.bindings.get(keys) {
-            Some(&command) => Lookup::Exact(command),
-            None if self.prefixes.contains(keys) => Lookup::Prefix,
-            None => Lookup::Unbound,
-        }
+        Keymap::from_bindings(bindings)
     }
 
     /// Every command with the keys bound to it, in registry order. Unbound commands are left out.
@@ -528,24 +559,24 @@ impl Keymap {
     }
 }
 
-fn seq_label(seq: &[Key]) -> String {
+pub fn seq_label(seq: &[Key]) -> String {
     seq.iter().map(|k| k.label()).collect()
 }
 
 /// What one key press did to the half-typed command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fed {
+pub enum Fed<C: Cmd = Command> {
     Pending,
     Run {
-        command: Command,
+        command: C,
         count: Option<usize>,
         arg: Option<char>,
     },
-    /// An operator with the motion that says which entries it covers. Without a motion the
-    /// operator was doubled (`dd`) and covers `count` entries from the cursor.
+    /// An operator with the motion that says what it covers. Without a motion the
+    /// operator was doubled (`dd`) and covers `count` lines from the cursor.
     Operate {
-        operator: Operator,
-        motion: Option<(Command, Option<char>)>,
+        operator: C::Op,
+        motion: Option<(C, Option<char>)>,
         count: Option<usize>,
     },
     Unbound,
@@ -554,19 +585,30 @@ pub enum Fed {
 const MAX_COUNT: usize = 99_999_999;
 
 #[derive(Debug, Clone)]
-struct PendingOp {
-    operator: Operator,
+struct PendingOp<O> {
+    operator: O,
     count: Option<usize>,
     label: String,
 }
 
 /// Count prefix, multi-key sequences, character arguments and operators waiting for a motion.
-#[derive(Debug, Default)]
-pub struct InputState {
+#[derive(Debug)]
+pub struct InputState<C: Cmd = Command> {
     count: Option<usize>,
     keys: Vec<Key>,
-    awaiting: Option<Command>,
-    operator: Option<PendingOp>,
+    awaiting: Option<C>,
+    operator: Option<PendingOp<C::Op>>,
+}
+
+impl<C: Cmd> Default for InputState<C> {
+    fn default() -> Self {
+        InputState {
+            count: None,
+            keys: Vec::new(),
+            awaiting: None,
+            operator: None,
+        }
+    }
 }
 
 fn combine(before: Option<usize>, after: Option<usize>) -> Option<usize> {
@@ -576,9 +618,9 @@ fn combine(before: Option<usize>, after: Option<usize>) -> Option<usize> {
     }
 }
 
-impl InputState {
+impl<C: Cmd> InputState<C> {
     /// `visual` makes operators act at once on the selected range instead of waiting for a motion.
-    pub fn feed(&mut self, key: Key, keymap: &Keymap, visual: bool) -> Fed {
+    pub fn feed(&mut self, key: Key, keymap: &Keymap<C>, visual: bool) -> Fed<C> {
         let cancels = key.code == KeyCode::Esc && !key.ctrl && !key.alt;
         if self.is_pending() && cancels {
             self.reset();
@@ -623,7 +665,7 @@ impl InputState {
         }
     }
 
-    fn exact(&mut self, command: Command, visual: bool) -> Fed {
+    fn exact(&mut self, command: C, visual: bool) -> Fed<C> {
         if let Some(pending) = self.operator.clone() {
             if command.operator() == Some(pending.operator) {
                 let count = combine(pending.count, self.count);
