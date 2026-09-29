@@ -3,6 +3,7 @@ pub mod app;
 pub mod clipboard;
 pub mod config;
 pub mod editmotion;
+pub mod editor;
 pub mod excmd;
 pub mod fileops;
 pub mod fsread;

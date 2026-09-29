@@ -106,6 +106,8 @@ pub struct Buffer {
     final_newline: bool,
     /// The file was empty, so the first text written to it gets a final newline as vim does.
     newline_for_new_text: bool,
+    /// Every line was deleted, so the file is written as empty instead of as one blank line.
+    emptied: bool,
     bom: bool,
     history: History,
     version: u64,
@@ -155,6 +157,7 @@ impl Buffer {
             eol,
             final_newline,
             newline_for_new_text: text.is_empty(),
+            emptied: false,
             bom,
             history: History::default(),
             version: 0,
@@ -162,6 +165,13 @@ impl Buffer {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        if self.emptied {
+            return if self.bom {
+                b"\xef\xbb\xbf".to_vec()
+            } else {
+                Vec::new()
+            };
+        }
         let blank = self.lines.len() == 1 && self.lines[0].is_empty();
         let final_newline = self.final_newline || (self.newline_for_new_text && !blank);
         let sep = match self.eol {
@@ -177,6 +187,11 @@ impl Buffer {
             out.extend(sep.as_bytes());
         }
         out
+    }
+
+    /// Declares that the buffer holds no lines at all, if it is down to one blank line. The next change ends that.
+    pub fn mark_emptied(&mut self) {
+        self.emptied = self.lines.len() == 1 && self.lines[0].is_empty();
     }
 
     /// Increases with every change, so caches can tell when the text moved on.
@@ -238,6 +253,7 @@ impl Buffer {
     /// Replaces the text from `start` up to `end` and returns where the inserted text ends.
     /// The change joins the open undo group.
     pub fn replace(&mut self, start: Pos, end: Pos, text: &str) -> Pos {
+        self.emptied = false;
         let (s, e) = (self.to_byte(start), self.to_byte(end));
         let (s, e) = if s <= e { (s, e) } else { (e, s) };
         let edit = Edit {
@@ -254,6 +270,7 @@ impl Buffer {
     }
 
     fn apply(&mut self, edit: &Edit) {
+        self.emptied = false;
         let end = edit.removed_end();
         let prefix = self.lines[edit.at.line][..edit.at.byte].to_string();
         let suffix = self.lines[end.line][end.byte..].to_string();
@@ -264,6 +281,7 @@ impl Buffer {
     }
 
     fn unapply(&mut self, edit: &Edit) {
+        self.emptied = false;
         let end = edit.inserted_end();
         let prefix = self.lines[edit.at.line][..edit.at.byte].to_string();
         let suffix = self.lines[end.line][end.byte..].to_string();
@@ -415,6 +433,24 @@ mod tests {
             "\n",
             "a file of one empty line is not empty"
         );
+    }
+
+    #[test]
+    fn a_buffer_with_every_line_deleted_is_written_empty_until_it_changes_again() {
+        let mut b = buf("one\ntwo\n");
+        b.replace(Pos::new(0, 0), Pos::new(1, 3), "");
+        assert_eq!(text(&b), "\n", "one blank line is a line");
+        b.mark_emptied();
+        assert_eq!(text(&b), "");
+        b.replace(Pos::new(0, 0), Pos::new(0, 0), "x");
+        assert_eq!(text(&b), "x\n");
+        b.begin_group(Pos::default());
+        b.replace(Pos::new(0, 0), Pos::new(0, 1), "");
+        b.mark_emptied();
+        b.end_group();
+        assert_eq!(text(&b), "");
+        b.undo();
+        assert_eq!(text(&b), "x\n", "undo ends the emptied state");
     }
 
     #[test]

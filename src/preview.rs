@@ -163,7 +163,7 @@ fn highlighter() -> &'static Highlighter {
     })
 }
 
-fn highlight(source: &[String], path: &Path) -> Vec<Line> {
+pub(crate) fn highlight(source: &[String], path: &Path) -> Vec<Line> {
     let plain = || {
         source
             .iter()
