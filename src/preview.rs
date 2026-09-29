@@ -17,7 +17,10 @@ use syntect::{
     util::LinesWithEndings,
 };
 
-use crate::theme::{DIM, FG};
+use crate::{
+    imageview::ImageData,
+    theme::{DIM, FG},
+};
 
 pub const HEAD_BYTES: usize = 64 * 1024;
 pub const MAX_LINES: usize = 500;
@@ -67,6 +70,8 @@ impl Line {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Content {
+    /// A decoded picture to draw above the lines, for image files.
+    pub image: Option<ImageData>,
     pub lines: Vec<Line>,
     /// Show line numbers in a gutter (source text, not dumps).
     pub numbered: bool,
@@ -75,6 +80,7 @@ pub struct Content {
 impl Content {
     fn message(text: &str) -> Content {
         Content {
+            image: None,
             lines: vec![Line::dim(text)],
             numbered: false,
         }
@@ -108,6 +114,19 @@ pub fn build(path: &Path) -> io::Result<Content> {
     if looks_like_text(&head, cut) {
         return Ok(text_content(&head, cut, meta.len(), path));
     }
+    let is_image = infer::get(&head).is_some_and(|k| k.mime_type().starts_with("image/"));
+    if is_image && meta.len() <= MAX_IMAGE_BYTES {
+        match decode_image(path) {
+            Ok(image) => return Ok(image_content(&head, &meta, image)),
+            Err(e) => {
+                let mut content = binary_content(&head, cut, &meta);
+                content
+                    .lines
+                    .insert(0, Line::dim(format!("cannot show the picture: {e}")));
+                return Ok(content);
+            }
+        }
+    }
     Ok(binary_content(&head, cut, &meta))
 }
 
@@ -125,6 +144,7 @@ fn text_content(head: &[u8], cut: bool, total: u64, path: &Path) -> Content {
         )));
     }
     Content {
+        image: None,
         lines,
         numbered: true,
     }
@@ -211,6 +231,43 @@ pub(crate) fn highlight(source: &[String], path: &Path) -> Vec<Line> {
     out
 }
 
+pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+/// Pictures are shrunk to this many pixels on their longer side, which is sharper than any terminal cell grid.
+const MAX_IMAGE_SIDE: u32 = 2048;
+
+fn decode_image(path: &Path) -> Result<ImageData, String> {
+    let mut reader = image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| e.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(20_000);
+    limits.max_image_height = Some(20_000);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().map_err(|e| e.to_string())?;
+    let image = if image.width() > MAX_IMAGE_SIDE || image.height() > MAX_IMAGE_SIDE {
+        image.thumbnail(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE)
+    } else {
+        image
+    };
+    Ok(ImageData(std::sync::Arc::new(image)))
+}
+
+fn image_content(head: &[u8], meta: &fs::Metadata, image: ImageData) -> Content {
+    let mut lines = vec![
+        card("type", &describe_type(head)),
+        card("size", &human_size(meta.len())),
+    ];
+    if let Ok(modified) = meta.modified() {
+        lines.push(card("modified", &format_time(modified)));
+    }
+    Content {
+        image: Some(image),
+        lines,
+        numbered: false,
+    }
+}
+
 fn binary_content(head: &[u8], cut: bool, meta: &fs::Metadata) -> Content {
     let mut lines = vec![
         card("type", &describe_type(head)),
@@ -234,6 +291,7 @@ fn binary_content(head: &[u8], cut: bool, meta: &fs::Metadata) -> Content {
         lines.push(Line::dim(format!("… first {HEX_BYTES} bytes shown")));
     }
     Content {
+        image: None,
         lines,
         numbered: false,
     }
@@ -370,6 +428,7 @@ fn archive_listing(path: &Path, kind: ArchiveKind, meta: &fs::Metadata) -> io::R
         lines.push(Line::dim(format!("… and {} more", total - items.len())));
     }
     Ok(Content {
+        image: None,
         lines,
         numbered: false,
     })
@@ -547,7 +606,9 @@ mod tests {
         let (_t, path) = file("pic.png", &png);
         let lines = text(&build(&path).unwrap());
         assert!(
-            lines[0].contains("image/png") && lines[0].contains("640×480 px"),
+            lines
+                .iter()
+                .any(|l| l.contains("image/png") && l.contains("640×480 px")),
             "{lines:?}"
         );
     }
@@ -651,5 +712,53 @@ mod tests {
         assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
         assert_eq!(format_mode(0o100644), "-rw-r--r-- (0644)");
         assert_eq!(format_mode(0o040755), "drwxr-xr-x (0755)");
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([10, 200, 30]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn pictures_are_decoded_for_display_with_a_short_card() {
+        let (_t, path) = file("pic.png", &png(64, 32));
+        let content = build(&path).unwrap();
+        let image = content.image.clone().expect("decoded");
+        assert_eq!((image.0.width(), image.0.height()), (64, 32));
+        let lines = text(&content);
+        assert!(
+            lines[0].contains("image/png") && lines[0].contains("64×32"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.starts_with("00000000")),
+            "no hex dump for pictures"
+        );
+    }
+
+    #[test]
+    fn huge_pictures_are_shrunk_after_decoding() {
+        let (_t, path) = file("wide.png", &png(4096, 100));
+        let image = build(&path).unwrap().image.unwrap();
+        assert_eq!(image.0.width(), MAX_IMAGE_SIDE);
+        assert!(image.0.height() <= 100);
+    }
+
+    #[test]
+    fn a_broken_picture_falls_back_to_the_card_and_says_why() {
+        let mut bytes = png(8, 8);
+        bytes.truncate(40);
+        let (_t, path) = file("broken.png", &bytes);
+        let content = build(&path).unwrap();
+        assert!(content.image.is_none());
+        assert!(
+            text(&content)[0].starts_with("cannot show the picture"),
+            "{:?}",
+            text(&content)
+        );
     }
 }

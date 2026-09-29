@@ -14,6 +14,7 @@ use crate::{
     editor::{EditEvent, Editor},
     excmd::{self, Ex},
     fileops::{FileOps, Finished, Job, JobSpec, PasteFlow, Step},
+    imageview::Painter,
     jumps::Jumps,
     keys::{Command, Fed, InputState, Key, Keymap, Operator},
     lineedit::LineEditor,
@@ -70,6 +71,9 @@ pub struct OverlayView<'a> {
 /// Startup choices that are not key bindings.
 pub struct Settings {
     pub show_hidden: bool,
+    /// Draws pictures in the preview.
+    pub painter: Painter,
+    pub depth: crate::theme::Depth,
     /// Percent of the width the folder columns may use.
     pub tree_width: u8,
     pub marks: Marks,
@@ -80,6 +84,8 @@ impl Default for Settings {
     fn default() -> Settings {
         Settings {
             show_hidden: false,
+            painter: Painter::halfblocks(),
+            depth: crate::theme::Depth::TrueColor,
             tree_width: 50,
             marks: Marks::default(),
             trash: Arc::new(NoTrash),
@@ -111,6 +117,8 @@ pub struct App {
     /// Where the last jump started, for `''`.
     previous: Option<PathBuf>,
     tree_width: u8,
+    painter: Painter,
+    depth: crate::theme::Depth,
     /// Rows available to the tree, for page-sized motions.
     viewport: u16,
     home: Option<PathBuf>,
@@ -137,6 +145,8 @@ impl App {
             pending_focus: None,
             previous: None,
             tree_width: settings.tree_width,
+            painter: settings.painter,
+            depth: settings.depth,
             viewport: 24,
             home: std::env::var_os("HOME").map(PathBuf::from),
             message: None,
@@ -160,6 +170,14 @@ impl App {
         if let Mode::Edit(editor) = &mut self.mode {
             editor.set_rows(usize::from(rows));
         }
+    }
+
+    pub fn depth(&self) -> crate::theme::Depth {
+        self.depth
+    }
+
+    pub fn painter(&self) -> &Painter {
+        &self.painter
     }
 
     pub fn tree_width(&self) -> u8 {

@@ -7,6 +7,7 @@ pub mod editor;
 pub mod excmd;
 pub mod fileops;
 pub mod fsread;
+pub mod imageview;
 pub mod jumps;
 pub mod keys;
 pub mod layout;

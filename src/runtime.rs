@@ -18,7 +18,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{
     DefaultTerminal,
     crossterm::{
-        event::{self, Event, KeyEventKind},
+        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
         execute,
         terminal::{EnterAlternateScreen, enable_raw_mode},
     },
@@ -52,6 +52,8 @@ enum Msg {
     Previewed(PreviewRequest, io::Result<Content>),
     JobProgress(u64, u64, u64),
     JobDone(u64, Outcome),
+    /// SIGTERM or SIGHUP: leave at once, putting the terminal back.
+    Terminate,
     FsChange(Vec<PathBuf>),
 }
 
@@ -62,6 +64,8 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
     let loader = spawn_loaders(tx.clone());
     let previewer = spawn_previewers(tx.clone());
     let worker = spawn_job_worker(tx.clone(), app.trasher());
+    spawn_signal_listener(tx.clone());
+    let mut last_image: Option<crate::imageview::Drawn> = None;
     let mut watcher = DirWatcher::new(tx);
     let mut dirty: HashSet<PathBuf> = HashSet::new();
     let mut flush_at: Option<Instant> = None;
@@ -85,6 +89,14 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
         watcher.sync(app.tree().dirs());
         app.set_viewport(terminal.size()?.height.saturating_sub(2));
         terminal.draw(|frame| render::render(app, frame.area(), frame.buffer_mut()))?;
+        let drawn = app.painter().take_drawn();
+        if app.painter().leaves_ghosts() && last_image.is_some() && drawn != last_image {
+            // Sixel and iTerm2 pixels can outlive the text drawn over them, so repaint everything.
+            terminal.clear()?;
+            terminal.draw(|frame| render::render(app, frame.area(), frame.buffer_mut()))?;
+            app.painter().take_drawn();
+        }
+        last_image = drawn;
 
         let wait = [
             flush_at.map(|t| t.saturating_duration_since(Instant::now())),
@@ -110,6 +122,14 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
         };
         for msg in first.into_iter().chain(rx.try_iter().collect::<Vec<_>>()) {
             match msg {
+                Msg::Terminate => return Ok(Exit::Abort),
+                Msg::Input(Event::Key(key))
+                    if key.kind == KeyEventKind::Press
+                        && key.code == KeyCode::Char('z')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    suspend(terminal, &gate)?;
+                }
                 Msg::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     let response = app.press(Key::from_event(key));
                     if let Some(exit) = response.exit {
@@ -176,6 +196,32 @@ fn open(
     if let Err(e) = outcome {
         app.message = Some(format!("{}: {e}", path.display()));
     }
+}
+
+/// Ctrl-Z: gives the terminal back to the shell and stops, like any job, until `fg` resumes it.
+fn suspend(terminal: &mut DefaultTerminal, gate: &InputGate) -> io::Result<()> {
+    gate.pause();
+    ratatui::restore();
+    let _ = signal_hook::low_level::raise(signal_hook::consts::SIGTSTP);
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    gate.resume();
+    terminal.clear()
+}
+
+fn spawn_signal_listener(tx: Sender<Msg>) {
+    use signal_hook::{
+        consts::{SIGHUP, SIGTERM},
+        iterator::Signals,
+    };
+    let Ok(mut signals) = Signals::new([SIGTERM, SIGHUP]) else {
+        return;
+    };
+    thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            let _ = tx.send(Msg::Terminate);
+        }
+    });
 }
 
 /// Lets the input thread be parked while an editor owns the terminal, so it cannot steal keystrokes.

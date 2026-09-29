@@ -843,6 +843,7 @@ mod tests {
     fn the_preview_cache_evicts_the_oldest_entries() {
         let mut cache = PreviewCache::default();
         let content = Arc::new(Content {
+            image: None,
             lines: Vec::new(),
             numbered: false,
         });

@@ -4,11 +4,13 @@ use clap::Parser;
 use tx::{
     app::{App, Exit, Settings},
     config::Config,
+    imageview::{Mode as ImageMode, Painter},
     keys::Keymap,
     marks::Marks,
     ops::SystemTrash,
     runtime,
     shell::{self, Shell},
+    theme::Depth,
 };
 
 /// Tree file explorer: every directory you enter opens a new column to the right.
@@ -42,9 +44,21 @@ fn main() -> io::Result<()> {
         notice = Some(format!("config: {error}"));
         Keymap::default()
     });
+    // Asking the terminal about graphics reads its answer from stdin, so it runs before anything else does.
+    let depth = config
+        .colors
+        .unwrap_or_else(|| Depth::detect(|name| std::env::var(name).ok()));
+    let images = if depth == Depth::None {
+        ImageMode::Off
+    } else {
+        config.images
+    };
+    let painter = Painter::new(images);
     let settings = Settings {
         show_hidden: config.show_hidden,
         tree_width: config.tree_width,
+        painter,
+        depth,
         marks: Marks::open(Marks::default_file()),
         trash: std::sync::Arc::new(SystemTrash),
     };

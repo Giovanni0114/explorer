@@ -9,6 +9,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{App, OverlayView},
+    imageview::Painter,
     layout::{self, Placed},
     model::{Entry, FilePreview, Kind, Level, Load, PreviewState},
     preview::{Content, Span},
@@ -56,7 +57,9 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         if p.level >= levels.len() {
             match (editor, preview) {
                 (Some(editor), _) => draw_editor(buf, tree, center, *p, editor),
-                (None, Some(preview)) => draw_preview(buf, tree, center, *p, preview),
+                (None, Some(preview)) => {
+                    draw_preview(buf, tree, center, *p, preview, app.painter());
+                }
                 (None, None) => {}
             }
             continue;
@@ -85,7 +88,11 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
                 editor_color(editor),
             ),
             (None, None, Some(preview)) => (
-                layout::block_brace(tree.height, center, preview_lines(preview)),
+                layout::block_brace(
+                    tree.height,
+                    center,
+                    preview_lines(preview, app.painter(), pair[1].width, tree.height),
+                ),
                 preview_color(preview),
             ),
             (None, None, None) => continue,
@@ -129,6 +136,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     if let Some(overlay) = app.overlay() {
         draw_overlay(buf, tree, overlay);
     }
+    theme::adapt(buf, app.depth());
 }
 
 fn draw_prompt_line(buf: &mut Buffer, area: Rect, label: &str, text: &str, cursor_col: usize) {
@@ -313,11 +321,29 @@ fn preview_color(preview: &FilePreview) -> (u8, u8, u8) {
     theme::level_color(preview.path.components().count())
 }
 
-fn preview_lines(preview: &FilePreview) -> usize {
+fn preview_lines(preview: &FilePreview, painter: &Painter, width: u16, height: u16) -> usize {
     match &preview.state {
-        PreviewState::Ready(content) => content.lines.len().max(1),
+        PreviewState::Ready(content) => match image_size(content, painter, width, height) {
+            Some(size) => usize::from(size.height) + 1 + content.lines.len(),
+            None => content.lines.len().max(1),
+        },
         _ => 1,
     }
+}
+
+/// Cells a preview's picture takes in a column, leaving room under it for the info lines.
+fn image_size(
+    content: &Content,
+    painter: &Painter,
+    width: u16,
+    height: u16,
+) -> Option<ratatui::layout::Size> {
+    let image = content.image.as_ref()?;
+    let room = height.saturating_sub(content.lines.len() as u16 + 1);
+    painter.fitted_size(
+        image,
+        ratatui::layout::Size::new(width.saturating_sub(1), room),
+    )
 }
 
 fn gutter_width(content: &Content) -> u16 {
@@ -327,7 +353,14 @@ fn gutter_width(content: &Content) -> u16 {
     content.lines.len().to_string().len().max(2) as u16 + 1
 }
 
-fn draw_preview(buf: &mut Buffer, tree: Rect, center: u16, p: Placed, preview: &FilePreview) {
+fn draw_preview(
+    buf: &mut Buffer,
+    tree: Rect,
+    center: u16,
+    p: Placed,
+    preview: &FilePreview,
+    painter: &Painter,
+) {
     let color = preview_color(preview);
     let x = tree.x + p.x;
     let note = |buf: &mut Buffer, text: &str| {
@@ -349,6 +382,31 @@ fn draw_preview(buf: &mut Buffer, tree: Rect, center: u16, p: Placed, preview: &
         }
         PreviewState::Ready(content) => content,
     };
+    if let (Some(image), Some(size)) = (
+        &content.image,
+        image_size(content, painter, p.width, tree.height),
+    ) {
+        let total = usize::from(size.height) + 1 + content.lines.len();
+        let (top, _) = layout::block_rows(tree.height, center, total);
+        let area = Rect::new(x + 1, tree.y + top, size.width, size.height);
+        painter.draw(&preview.path, image, area, buf);
+        for (i, line) in content.lines.iter().enumerate() {
+            let y = tree.y + top + size.height + 1 + i as u16;
+            if y >= tree.bottom() {
+                break;
+            }
+            let mut cx = x + 1;
+            for span in &line.0 {
+                let end = x + p.width;
+                if cx >= end {
+                    break;
+                }
+                let style = Style::new().fg(theme::rgb(span.color));
+                (cx, _) = buf.set_stringn(cx, y, &span.text, usize::from(end - cx), style);
+            }
+        }
+        return;
+    }
     let total = content.lines.len();
     let (top, count) = layout::block_rows(tree.height, center, total);
     let scroll = preview.scroll.min(total.saturating_sub(usize::from(count)));
@@ -1354,6 +1412,108 @@ mod tests {
             footer(&lines).starts_with("-- VISUAL LINE --"),
             "{:?}",
             footer(&lines)
+        );
+    }
+
+    fn write_png(path: &std::path::Path, w: u32, h: u32) {
+        let img = image::RgbImage::from_fn(w, h, |x, _| {
+            if x < w / 2 {
+                image::Rgb([230, 20, 20])
+            } else {
+                image::Rgb([20, 20, 230])
+            }
+        });
+        img.save(path).unwrap();
+    }
+
+    #[test]
+    fn a_picture_is_drawn_in_the_preview_with_its_card_under_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_png(&tmp.path().join("photo.png"), 200, 100);
+        let app = open(tmp.path());
+        let (lines, buf) = rows(&app, 100, 30);
+        let card = row_of(&lines, "image/png");
+        assert!(lines[card].contains("200×100"), "{lines:#?}");
+        let tip = row_of(&lines, "─┤");
+        let brace_x = lines[tip].chars().position(|c| c == '┤').unwrap() as u16;
+        let reds_and_blues: Vec<_> = (brace_x + 3..100)
+            .map(|x| buf[(x, (card - 2) as u16)].fg)
+            .filter(|c| *c != theme::rgb(BG) && *c != ratatui::style::Color::Reset)
+            .collect();
+        assert!(
+            reds_and_blues.len() > 10,
+            "half blocks fill the row above the card: {lines:#?}"
+        );
+        assert_ne!(
+            reds_and_blues.first(),
+            reds_and_blues.last(),
+            "red on the left, blue on the right"
+        );
+    }
+
+    #[test]
+    fn with_images_off_a_picture_shows_only_its_card() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_png(&tmp.path().join("photo.png"), 20, 10);
+        let mut app = App::with_settings(
+            tmp.path().to_path_buf(),
+            Keymap::default(),
+            crate::app::Settings {
+                painter: crate::imageview::Painter::off(),
+                ..Default::default()
+            },
+        );
+        app.settle();
+        let (lines, _) = rows(&app, 100, 15);
+        assert_eq!(
+            lines[row_of(&lines, "photo.png")],
+            lines[7],
+            "the card sits on the cursor row"
+        );
+        assert!(lines.iter().any(|l| l.contains("image/png")));
+        assert!(
+            !lines.iter().any(|l| l.contains('▀') || l.contains('▄')),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn without_colour_the_cursor_row_is_reverse_video() {
+        let tmp = fixture();
+        let mut app = App::with_settings(
+            tmp.path().to_path_buf(),
+            Keymap::default(),
+            crate::app::Settings {
+                depth: theme::Depth::None,
+                ..Default::default()
+            },
+        );
+        app.settle();
+        let (lines, buf) = rows(&app, 100, 11);
+        let x = lines[5].find("alpha/").unwrap() as u16;
+        assert!(buf[(x, 5)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(x, 5)].fg, ratatui::style::Color::Reset);
+        assert!(!buf[(x, 4)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn in_256_colours_every_cell_uses_the_palette() {
+        let tmp = fixture();
+        let mut app = App::with_settings(
+            tmp.path().to_path_buf(),
+            Keymap::default(),
+            crate::app::Settings {
+                depth: theme::Depth::Ansi256,
+                ..Default::default()
+            },
+        );
+        app.settle();
+        let (_, buf) = rows(&app, 100, 11);
+        assert!(
+            buf.content
+                .iter()
+                .all(|c| !matches!(c.fg, ratatui::style::Color::Rgb(..))
+                    && !matches!(c.bg, ratatui::style::Color::Rgb(..)))
         );
     }
 }

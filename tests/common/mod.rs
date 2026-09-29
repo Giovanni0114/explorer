@@ -39,10 +39,14 @@ impl Session {
     pub fn spawn_with(root: &Path, opts: Opts) -> Session {
         let home = tempfile::tempdir().unwrap();
         let config_dir = home.path().join("config");
-        if let Some(config) = opts.config {
-            fs::create_dir_all(config_dir.join("tx")).unwrap();
-            fs::write(config_dir.join("tx/config.toml"), config).unwrap();
-        }
+        // The test terminal never answers the graphics query, so tests draw pictures with half blocks.
+        let config = match opts.config {
+            Some(config) if config.contains("images") => config.to_string(),
+            Some(config) => format!("images = \"halfblocks\"\n{config}"),
+            None => "images = \"halfblocks\"\n".to_string(),
+        };
+        fs::create_dir_all(config_dir.join("tx")).unwrap();
+        fs::write(config_dir.join("tx/config.toml"), config).unwrap();
         let cwd_file = home.path().join("cwd");
 
         let pair = native_pty_system()
@@ -116,6 +120,26 @@ impl Session {
             .screen()
             .cell(row, col)
             .map_or(vt100::Color::Default, |c| c.fgcolor())
+    }
+
+    pub fn inverse(&self, row: u16, col: u16) -> bool {
+        let parser = self.parser.lock().unwrap();
+        parser.screen().cell(row, col).is_some_and(|c| c.inverse())
+    }
+
+    /// Whether the program switched back from the alternate screen, as it must on exit.
+    pub fn left_alternate_screen(&self) -> bool {
+        !self.parser.lock().unwrap().screen().alternate_screen()
+    }
+
+    pub fn signal(&self, signal: i32) {
+        let pid = self.child.process_id().expect("a running child");
+        let status = std::process::Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(pid.to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     pub fn bg(&self, row: u16, col: u16) -> vt100::Color {

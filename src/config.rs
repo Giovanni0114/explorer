@@ -20,6 +20,12 @@ pub struct Config {
     pub show_hidden: bool,
     /// Percent of the screen width the folder columns may use. The file preview gets the rest.
     pub tree_width: u8,
+    /// How pictures are drawn: auto, kitty, sixel, iterm2, halfblocks or off.
+    pub images: crate::imageview::Mode,
+    /// Forced colour depth, or `None` to read it from the environment.
+    pub colors: Option<crate::theme::Depth>,
+    /// Clicks and the wheel move around. Off leaves the mouse to the terminal, for selecting text.
+    pub mouse: bool,
 }
 
 impl Default for Config {
@@ -29,6 +35,9 @@ impl Default for Config {
             keys: BTreeMap::new(),
             show_hidden: false,
             tree_width: 50,
+            images: crate::imageview::Mode::Auto,
+            colors: None,
+            mouse: true,
         }
     }
 }
@@ -40,6 +49,9 @@ struct Raw {
     keys: Option<BTreeMap<String, String>>,
     show_hidden: Option<bool>,
     tree_width: Option<u8>,
+    images: Option<String>,
+    colors: Option<String>,
+    mouse: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +91,21 @@ impl Config {
             editors,
             keys: raw.keys.unwrap_or_default(),
             show_hidden: raw.show_hidden.unwrap_or(false),
+            mouse: raw.mouse.unwrap_or(true),
+            colors: match raw.colors.as_deref() {
+                None => None,
+                Some(word) => crate::theme::Depth::parse(word).ok_or_else(|| {
+                    serde::de::Error::custom("colors is one of auto, truecolor, 256, 16 or none")
+                })?,
+            },
+            images: match raw.images.as_deref() {
+                None => crate::imageview::Mode::Auto,
+                Some(word) => crate::imageview::Mode::parse(word).ok_or_else(|| {
+                    serde::de::Error::custom(
+                        "images is one of auto, kitty, sixel, iterm2, halfblocks or off",
+                    )
+                })?,
+            },
             tree_width: match raw.tree_width {
                 None => 50,
                 Some(percent @ 20..=100) => percent,
@@ -169,6 +196,29 @@ mod tests {
         assert!(Config::parse("tree_width = 10").is_err());
         assert!(Config::parse("tree_width = 150").is_err());
         assert!(Config::parse("tree_width = 300").is_err());
+    }
+
+    #[test]
+    fn images_names_a_drawing_method() {
+        use crate::imageview::Mode;
+        assert_eq!(Config::parse("").unwrap().images, Mode::Auto);
+        assert_eq!(Config::parse("images = 'off'").unwrap().images, Mode::Off);
+        assert_eq!(
+            Config::parse("images = 'sixel'").unwrap().images,
+            Mode::Sixel
+        );
+        assert!(Config::parse("images = 'svga'").is_err());
+    }
+
+    #[test]
+    fn colors_and_mouse_are_read() {
+        use crate::theme::Depth;
+        let defaults = Config::parse("").unwrap();
+        assert_eq!((defaults.colors, defaults.mouse), (None, true));
+        let set = Config::parse("colors = '256'\nmouse = false").unwrap();
+        assert_eq!((set.colors, set.mouse), (Some(Depth::Ansi256), false));
+        assert_eq!(Config::parse("colors = 'auto'").unwrap().colors, None);
+        assert!(Config::parse("colors = 'many'").is_err());
     }
 
     #[test]

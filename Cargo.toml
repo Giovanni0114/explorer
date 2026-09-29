@@ -7,12 +7,15 @@ edition = "2024"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6.7", features = ["derive"] }
 flate2 = "1.1.10"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
 imagesize = "0.15.0"
 infer = "0.22.0"
 notify = "8.2.0"
 ratatui = "0.30.2"
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 rustix = { version = "1.1.5", features = ["fs"] }
 serde = { version = "1.0.229", features = ["derive"] }
+signal-hook = "0.4.4"
 syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 tar = "0.4.46"
 toml = "1.1.6"
@@ -22,6 +25,7 @@ unicode-width = "0.2.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 portable-pty = "0.9.0"
 tempfile = "3.27.0"
 vt100 = "0.16.2"

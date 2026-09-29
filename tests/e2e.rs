@@ -555,3 +555,58 @@ fn visual_mode_in_the_editor_deletes_a_selection() {
         "keep\nkeep too\n"
     );
 }
+
+#[test]
+fn a_picture_is_previewed_with_coloured_half_blocks() {
+    let tmp = fixture();
+    let img = image::RgbImage::from_fn(120, 60, |x, _| {
+        if x < 60 {
+            image::Rgb([230, 20, 20])
+        } else {
+            image::Rgb([20, 20, 230])
+        }
+    });
+    img.save(tmp.path().join("a-photo.png")).unwrap();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("fa");
+    let rows = s.wait_for_text("image/png");
+    let card = rows.iter().position(|r| r.contains("image/png")).unwrap();
+    let row = (card - 2) as u16;
+    let colours: Vec<_> = (0..common::COLS)
+        .map(|x| s.fg(row, x))
+        .filter(|c| matches!(c, vt100::Color::Rgb(..)))
+        .collect();
+    assert!(colours.len() > 10, "the picture is drawn: {rows:#?}");
+}
+
+#[test]
+fn no_color_draws_without_colours_and_keeps_the_cursor_visible() {
+    let tmp = fixture();
+    let s = Session::spawn_with(
+        tmp.path(),
+        Opts {
+            env: vec![("NO_COLOR", "1".to_string())],
+            ..Opts::default()
+        },
+    );
+    let rows = s.wait_for_text("apps/");
+    let row = Session::CENTER as u16;
+    let col = rows[Session::CENTER].find("apps/").unwrap() as u16;
+    assert_eq!(s.fg(row, col), vt100::Color::Default);
+    assert!(s.inverse(row, col), "the cursor row is reverse video");
+}
+
+#[test]
+fn sigterm_restores_the_terminal_and_exits() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.signal(libc_sigterm());
+    assert_eq!(s.wait_exit(), 0);
+    assert!(s.left_alternate_screen(), "the shell screen is back");
+}
+
+fn libc_sigterm() -> i32 {
+    15
+}
