@@ -405,13 +405,32 @@ fn spawn_previewers(msgs: Sender<Msg>, wanted: Wanted) -> Sender<PreviewRequest>
                     Ok(request) => request,
                     Err(_) => return,
                 };
-                let result = if wanted.lock().unwrap().as_ref() != Some(&request.path) {
-                    Err(io::Error::new(io::ErrorKind::Interrupted, "skipped"))
-                } else {
-                    // A decoder that panics on a malformed file must not take the worker down with it.
-                    std::panic::catch_unwind(|| preview::build(&request.path))
-                        .unwrap_or_else(|_| Err(io::Error::other("the file could not be read")))
-                };
+                let still_wanted = |path: &PathBuf| wanted.lock().unwrap().as_ref() == Some(path);
+                if !still_wanted(&request.path) {
+                    let skipped = Err(io::Error::new(io::ErrorKind::Interrupted, "skipped"));
+                    if msgs.send(Msg::Previewed(request, skipped)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                // A photo carries a small picture of itself in its header. Showing that first fills
+                // the column in about a millisecond; the full decode replaces it when it lands.
+                let quick = std::panic::catch_unwind(|| preview::build_quick(&request.path))
+                    .unwrap_or(None);
+                if let Some(content) = quick {
+                    if msgs
+                        .send(Msg::Previewed(request.clone(), Ok(content)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if !still_wanted(&request.path) {
+                        continue;
+                    }
+                }
+                // A decoder that panics on a malformed file must not take the worker down with it.
+                let result = std::panic::catch_unwind(|| preview::build(&request.path))
+                    .unwrap_or_else(|_| Err(io::Error::other("the file could not be read")));
                 if msgs.send(Msg::Previewed(request, result)).is_err() {
                     return;
                 }
