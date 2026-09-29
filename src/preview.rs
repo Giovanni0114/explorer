@@ -310,8 +310,10 @@ fn decode_jpeg_scaled(path: &Path, width: u32, height: u32) -> Result<image::Dyn
     let mut decoder = jpeg_decoder::Decoder::new(file);
     decoder.set_max_decoding_buffer_size(512 * 1024 * 1024);
     let clamp = |v: u32| v.min(u32::from(u16::MAX)) as u16;
+    // The codec only divides by 2, 4 or 8 and picks the smallest result at least as big as asked.
+    // Asking for two thirds lands within 2/3 to 4/3 of the target, which skips a costly shrink afterwards.
     let (w, h) = decoder
-        .scale(clamp(width), clamp(height))
+        .scale(clamp(width * 2 / 3), clamp(height * 2 / 3))
         .map_err(|e| e.to_string())?;
     let pixels = decoder.decode().map_err(|e| e.to_string())?;
     let format = decoder.info().ok_or("no image information")?.pixel_format;

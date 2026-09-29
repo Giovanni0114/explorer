@@ -39,6 +39,7 @@ fn main() {
         full.height()
     );
     drop(full);
+    // A 220x55 terminal with the folders taking half the width, as by default.
     let screen = (220u16, 55u16);
     println!(
         "{}",
@@ -51,7 +52,7 @@ fn main() {
             tx::imageview::Painter::new(tx::imageview::Mode::Sixel, None),
         ),
     ] {
-        let (w, h) = painter.decode_target(screen.0, screen.1);
+        let (w, h) = painter.decode_target(screen.0 / 2, screen.1 - 2);
         tx::preview::set_image_target(w, h);
         let t = Instant::now();
         let content = tx::preview::build(&path).unwrap();

@@ -126,12 +126,14 @@ pub fn choose(
     let graphics = |p, what: &str| (Method::Graphics(p), format!("{what}: {heard}"));
     let konsole = name.contains("konsole") || var("KONSOLE_VERSION").is_some();
     let wezterm = name.contains("wezterm") || program.contains("WezTerm");
+    // iTerm2 sends LC_TERMINAL through SSH, where TERM_PROGRAM does not arrive.
+    let iterm2 =
+        name.contains("iterm2") || program.contains("iTerm") || get("LC_TERMINAL") == "iTerm2";
     // Konsole and WezTerm accept kitty graphics but not the unicode placeholders it is drawn with here.
     if konsole {
         return graphics(ProtocolType::Sixel, "sixel");
     }
-    if wezterm || name.contains("iterm2") || program.contains("iTerm") || program.contains("mintty")
-    {
+    if wezterm || iterm2 || program.contains("mintty") {
         return graphics(ProtocolType::Iterm2, "iTerm2 images");
     }
     if answers.kitty || term == "xterm-kitty" || term == "xterm-ghostty" || program == "ghostty" {
@@ -380,7 +382,7 @@ impl Painter {
         }
     }
 
-    /// The largest picture worth decoding for a terminal of this many cells.
+    /// The largest picture worth decoding for a preview column of this many cells.
     pub fn decode_target(&self, columns: u16, rows: u16) -> (u32, u32) {
         match self.method {
             Method::Graphics(_) => (
@@ -754,6 +756,18 @@ mod tests {
         assert_eq!(
             method(Mode::Auto, None, &[("TERM", "xterm-256color")]),
             Method::Blocks(BlockKind::Quadrants)
+        );
+    }
+
+    #[test]
+    fn iterm2_is_recognised_over_ssh_by_lc_terminal() {
+        assert_eq!(
+            method(
+                Mode::Auto,
+                None,
+                &[("TERM", "xterm-256color"), ("LC_TERMINAL", "iTerm2")]
+            ),
+            Method::Graphics(ProtocolType::Iterm2)
         );
     }
 
