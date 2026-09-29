@@ -1,0 +1,4 @@
+# Static ARM64 builds (Raspberry Pi 4/5, other 64-bit ARM boards) link with the linker Rust ships,
+# so no cross toolchain is needed: cargo build --profile dist --target aarch64-unknown-linux-musl
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
