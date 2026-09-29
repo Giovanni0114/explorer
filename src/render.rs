@@ -665,15 +665,13 @@ fn draw_column(
         let y = tree.y + row;
         let entry = &level.entries[i];
         let is_cursor = i == level.cursor;
-        let distance = i.abs_diff(level.cursor);
 
         let base = if entry.is_dir() {
             color
         } else {
             theme::blend(color, FG, 0.55)
         };
-        let fade = (1.0 - distance as f32 * 0.14).max(0.3);
-        let mut style = Style::new().fg(theme::rgb(theme::blend(base, BG, fade)));
+        let mut style = Style::new().fg(theme::rgb(base));
         if is_cursor {
             let bg = match role {
                 Role::Focused => color,
@@ -728,7 +726,7 @@ fn draw_column(
         let meta_style = if is_cursor && role == Role::Focused {
             style
         } else {
-            style.fg(theme::rgb(theme::blend(DIM, BG, fade)))
+            style.fg(theme::rgb(DIM))
         };
         let meta_x = (x + p.width).saturating_sub(1 + meta.width() as u16).max(x);
         buf.set_string(meta_x, y, meta, meta_style);
@@ -1530,5 +1528,18 @@ mod tests {
                 .all(|c| !matches!(c.fg, ratatui::style::Color::Rgb(..))
                     && !matches!(c.bg, ratatui::style::Color::Rgb(..)))
         );
+    }
+
+    #[test]
+    fn entries_far_from_the_cursor_keep_their_full_colour() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            fs::write(tmp.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let app = open(tmp.path());
+        let (lines, buf) = rows(&app, 100, 21);
+        let near = row_of(&lines, "f1.txt") as u16;
+        let far = row_of(&lines, "f7.txt") as u16;
+        assert_eq!(buf[(1, near)].fg, buf[(1, far)].fg);
     }
 }
