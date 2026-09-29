@@ -63,7 +63,13 @@ fn main() -> io::Result<()> {
     );
     let answers = if asks {
         let in_tmux = std::env::var_os("TMUX").is_some();
-        termquery::ask(in_tmux, std::time::Duration::from_millis(500)).ok()
+        // Over SSH the answers cross the network. Reading stops at the DA1 answer anyway, so a longer
+        // limit only costs time with a terminal that never answers, and an answer arriving after the
+        // limit would be read as keystrokes.
+        let over_ssh =
+            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+        let limit = if over_ssh { 2000 } else { 500 };
+        termquery::ask(in_tmux, std::time::Duration::from_millis(limit)).ok()
     } else {
         None
     };
