@@ -19,6 +19,7 @@ pub mod preview;
 pub mod prompt;
 pub mod render;
 pub mod runtime;
+pub mod save;
 pub mod search;
 pub mod shell;
 pub mod textbuf;

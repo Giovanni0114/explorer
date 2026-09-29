@@ -449,3 +449,83 @@ fn a_selection_made_with_space_survives_moving_around() {
     assert!(!tmp.path().join("apps").exists());
     assert!(tmp.path().join("zeta").exists(), "only the selection went");
 }
+
+#[test]
+fn i_edits_a_file_in_place_and_colon_wq_saves_it() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("G");
+    s.wait("on README", |r| center(r).contains("README.md"));
+    s.send("i");
+    let rows = s.wait_for_text(":w save");
+    assert!(rows[0].contains("README.md"), "{:?}", rows[0]);
+    s.send("A more words");
+    s.wait_for_text("-- INSERT --");
+    s.send(ESC);
+    s.wait("dirty marker", |r| r[0].contains("[+]"));
+    s.send("onew line");
+    s.send(ESC);
+    s.send(":wq\r");
+    s.wait("back in the tree", |r| {
+        r.last().unwrap().contains("j/k move")
+    });
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+        "# readme more words\nnew line\n"
+    );
+    s.wait("preview shows the saved text", |r| {
+        r.iter().any(|x| x.contains("2 new line"))
+    });
+}
+
+#[test]
+fn the_editor_refuses_to_quit_with_unsaved_changes_and_undo_works() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("Gi");
+    s.wait_for_text(":w save");
+    s.send("dd");
+    s.wait("line deleted", |r| {
+        !r.iter().any(|x| x.contains("# readme"))
+    });
+    s.send(":q\r");
+    s.wait_for_text("unsaved changes");
+    s.send("u");
+    s.wait("line back", |r| r.iter().any(|x| x.contains("# readme")));
+    s.send(":q!\r");
+    s.wait("back in the tree", |r| {
+        r.last().unwrap().contains("j/k move")
+    });
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+        "# readme\n"
+    );
+}
+
+#[test]
+fn a_file_changed_by_another_program_is_not_overwritten() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("Gi");
+    s.wait_for_text(":w save");
+    s.send("x");
+    s.wait("dirty marker", |r| r[0].contains("[+]"));
+    std::fs::write(
+        tmp.path().join("README.md"),
+        "changed by someone else, longer\n",
+    )
+    .unwrap();
+    s.send(":w\r");
+    s.wait_for_text("changed on disk");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+        "changed by someone else, longer\n"
+    );
+    s.send(":e!\r");
+    s.wait("reloaded text", |r| {
+        r.iter().any(|x| x.contains("changed by someone else"))
+    });
+}

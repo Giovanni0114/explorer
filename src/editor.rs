@@ -392,34 +392,60 @@ impl Editor {
         self.buf.line(index)
     }
 
-    /// Syntax colors for a line, or plain text when the colors are out of date.
+    /// Syntax colors for a line. A line changed since the colors were made shows plain until the next refresh.
     pub fn styled_line(&self, index: usize) -> Line {
-        match &self.highlight {
-            Some((version, lines)) if *version == self.buf.version() && index < lines.len() => {
-                lines[index].clone()
-            }
-            _ => Line(vec![preview::Span {
-                text: self.buf.line(index).to_string(),
-                color: crate::theme::FG,
-                bold: false,
-                italic: false,
-            }]),
+        let text = self.buf.line(index);
+        if let Some((_, lines)) = &self.highlight
+            && let Some(line) = lines.get(index)
+            && line.text() == text
+        {
+            return line.clone();
         }
+        Line(vec![preview::Span {
+            text: text.to_string(),
+            color: crate::theme::FG,
+            bold: false,
+            italic: false,
+        }])
     }
 
-    /// Recomputes syntax colors when the text has changed since they were made.
-    pub fn refresh_highlight(&mut self) {
-        if self
-            .highlight
+    /// Whether the colors are older than the text.
+    pub fn highlight_stale(&self) -> bool {
+        self.highlight
             .as_ref()
-            .is_some_and(|(v, _)| *v == self.buf.version())
-        {
+            .is_none_or(|(version, _)| *version != self.buf.version())
+    }
+
+    /// Recomputes syntax colors down to the bottom of the view.
+    pub fn refresh_highlight(&mut self) {
+        if !self.highlight_stale() {
             return;
         }
-        let shown = self.buf.line_count().min(HIGHLIGHT_LINES);
+        let shown = (self.top + self.rows)
+            .max(self.rows * 2)
+            .min(self.buf.line_count())
+            .min(HIGHLIGHT_LINES);
         let mut lines = preview::highlight(&self.buf.lines()[..shown], &self.path);
         lines.truncate(shown);
         self.highlight = Some((self.buf.version(), lines));
+    }
+
+    /// Takes the text of the file again after `:e!`, keeping the cursor where it can stay.
+    pub fn reload(&mut self, bytes: &[u8], disk_key: PreviewKey) -> Result<(), LoadError> {
+        let buf = Buffer::from_bytes(bytes)?;
+        self.saved_version = buf.version();
+        self.buf = buf;
+        self.disk_key = disk_key;
+        self.highlight = None;
+        self.mode = Mode::Normal;
+        self.input.reset();
+        self.cursor = self.buf.clamp(self.cursor, false);
+        self.scroll_to_cursor();
+        Ok(())
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
     }
 
     /// Terminal column of the cursor within its line, with tabs expanded.
@@ -428,6 +454,11 @@ impl Editor {
     }
 
     pub fn press(&mut self, key: Key) -> Option<EditEvent> {
+        // A terminal sends Esc and a fast next key as one Alt chord. Nothing here is bound to Alt, so split it.
+        if key.alt {
+            self.press(Key::plain(KeyCode::Esc));
+            return self.press(Key { alt: false, ..key });
+        }
         self.message = None;
         let event = match self.mode {
             Mode::Prompt(_) => self.press_prompt(key),
@@ -1618,6 +1649,22 @@ mod tests {
     }
 
     #[test]
+    fn an_alt_chord_is_escape_followed_by_the_key() {
+        let mut e = ed("x\n");
+        keys(&mut e, "Aab");
+        let events = keys(&mut e, "<a-:>wq<cr>");
+        assert_eq!(
+            events,
+            [EditEvent::Save {
+                force: false,
+                then_close: true
+            }]
+        );
+        assert_eq!(text(&e), "xab\n");
+        assert!(!e.is_insert());
+    }
+
+    #[test]
     fn dirty_tracks_edits_and_saving() {
         let mut e = ed("x\n");
         assert!(!e.dirty());
@@ -1730,7 +1777,12 @@ mod tests {
             "keywords and names split into spans"
         );
         keys(&mut e, "x");
-        assert_eq!(e.styled_line(0).0.len(), 1, "stale colors are not shown");
+        assert_eq!(
+            e.styled_line(0).0.len(),
+            1,
+            "a changed line is plain until the refresh"
+        );
+        assert!(e.highlight_stale());
         e.refresh_highlight();
         assert!(e.styled_line(0).0.len() > 1);
     }

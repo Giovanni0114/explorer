@@ -46,17 +46,23 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
 
     let focus = app.tree().focus();
     let levels = app.tree().levels();
-    let preview = app.tree().preview();
+    let editor = app.editor();
+    let preview = app.tree().preview().filter(|_| editor.is_none());
     let mut cols: Vec<Col> = levels
         .iter()
         .map(|l| Col::rigid(natural_width(l)))
         .collect();
     cols.extend(preview.map(preview_col));
+    cols.extend(editor.map(editor_col));
     let placed = layout::place_columns(&cols, tree.width, focus);
 
     for p in &placed {
-        if let (true, Some(preview)) = (p.level >= levels.len(), preview) {
-            draw_preview(buf, tree, center, *p, preview);
+        if p.level >= levels.len() {
+            match (editor, preview) {
+                (Some(editor), _) => draw_editor(buf, tree, center, *p, editor),
+                (None, Some(preview)) => draw_preview(buf, tree, center, *p, preview),
+                (None, None) => {}
+            }
             continue;
         }
         let role = match p.level.cmp(&focus) {
@@ -73,16 +79,20 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         draw_column(buf, tree, center, *p, &levels[p.level], role, &marks);
     }
     for pair in placed.windows(2) {
-        let (spec, color) = match (levels.get(pair[1].level), preview) {
-            (Some(child), _) => (
+        let (spec, color) = match (levels.get(pair[1].level), editor, preview) {
+            (Some(child), _, _) => (
                 layout::brace(tree.height, center, child.entries.len(), child.cursor),
                 level_color(child),
             ),
-            (None, Some(preview)) => (
+            (None, Some(editor), _) => (
+                layout::block_brace(tree.height, center, editor.line_count()),
+                editor_color(editor),
+            ),
+            (None, None, Some(preview)) => (
                 layout::block_brace(tree.height, center, preview_lines(preview)),
                 preview_color(preview),
             ),
-            (None, None) => continue,
+            (None, None, None) => continue,
         };
         let style = Style::new().fg(theme::rgb(color));
         let x = tree.x + pair[0].x + pair[0].width;
@@ -96,12 +106,20 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         }
     }
 
+    let header = match editor {
+        Some(editor) => format!(
+            "{}{}",
+            tilde(editor.path()),
+            if editor.dirty() { "  [+]" } else { "" }
+        ),
+        None => tilde(app.tree().current_dir()),
+    };
     buf.set_stringn(
         area.x + 1,
         area.y,
-        tilde(app.tree().current_dir()),
+        header,
         usize::from(area.width.saturating_sub(2)),
-        Style::new().fg(theme::rgb(DIM)),
+        Style::new().fg(theme::rgb(if editor.is_some() { FG } else { DIM })),
     );
     if app.tree().show_hidden() {
         let label = "dotfiles shown";
@@ -117,7 +135,54 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     }
 }
 
+fn draw_prompt_line(buf: &mut Buffer, area: Rect, label: &str, text: &str, cursor_col: usize) {
+    let y = area.y + area.height - 1;
+    let width = usize::from(area.width.saturating_sub(2));
+    let line = format!("{label}{text}");
+    buf.set_stringn(area.x + 1, y, &line, width, Style::new().fg(theme::rgb(FG)));
+    let cursor_x = area.x + 1 + (label.width() + cursor_col) as u16;
+    if cursor_x < area.right() {
+        let cell = &mut buf[(cursor_x, y)];
+        if cursor_col >= text.width() {
+            cell.set_char(' ');
+        }
+        cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
+    }
+}
+
+fn draw_editor_footer(buf: &mut Buffer, area: Rect, editor: &crate::editor::Editor) {
+    if let Some((label, text, cursor_col)) = editor.prompt_view() {
+        return draw_prompt_line(buf, area, label, text, cursor_col);
+    }
+    let y = area.y + area.height - 1;
+    let width = usize::from(area.width.saturating_sub(2));
+    let position = format!("{}:{}", editor.cursor().line + 1, editor.cursor().col + 1);
+    let pending = editor.pending();
+    let right = format!("{pending}  {position}");
+    let (text, color) = match (&editor.message, editor.is_insert()) {
+        (Some(message), _) => (message.as_str(), WARN),
+        (None, true) => ("-- INSERT --   Esc back to normal", FG),
+        (None, false) => (":w save   :q close   :wq both   i insert   u undo", DIM),
+    };
+    let left_width = width.saturating_sub(right.width() + 2);
+    buf.set_stringn(
+        area.x + 1,
+        y,
+        text,
+        left_width,
+        Style::new().fg(theme::rgb(color)),
+    );
+    let x = area
+        .right()
+        .saturating_sub(right.width() as u16 + 1)
+        .max(area.x);
+    buf.set_string(x, y, &right, Style::new().fg(theme::rgb(DIM)));
+}
+
 fn draw_footer(buf: &mut Buffer, area: Rect, app: &App) {
+    if let Some(editor) = app.editor() {
+        return draw_editor_footer(buf, area, editor);
+    }
     let y = area.y + area.height - 1;
     let width = usize::from(area.width.saturating_sub(2));
     if let Some(prompt) = app.prompt_view() {
@@ -342,6 +407,132 @@ fn draw_preview(buf: &mut Buffer, tree: Rect, center: u16, p: Placed, preview: &
                 style = style.add_modifier(Modifier::ITALIC);
             }
             (cx, _) = buf.set_stringn(cx, y, text, usize::from(end - cx), style);
+        }
+    }
+}
+
+fn editor_color(editor: &crate::editor::Editor) -> (u8, u8, u8) {
+    theme::level_color(editor.path().components().count())
+}
+
+fn editor_gutter(editor: &crate::editor::Editor) -> u16 {
+    editor.line_count().to_string().len().max(2) as u16 + 1
+}
+
+fn editor_col(editor: &crate::editor::Editor) -> Col {
+    let longest = (0..editor.line_count().min(PREVIEW_MEASURED_LINES))
+        .map(|i| crate::editor::display_col(editor.line_text(i), usize::MAX))
+        .max()
+        .unwrap_or(0) as u16;
+    let natural = (longest + editor_gutter(editor) + 3).clamp(40, PREVIEW_MAX_WIDTH);
+    Col {
+        natural,
+        min: PREVIEW_MIN_WIDTH,
+    }
+}
+
+/// The file being edited, with line numbers, syntax colors and a block cursor. Long lines scroll
+/// sideways together so the cursor stays in view.
+fn draw_editor(
+    buf: &mut Buffer,
+    tree: Rect,
+    center: u16,
+    p: Placed,
+    editor: &crate::editor::Editor,
+) {
+    let color = editor_color(editor);
+    let total = editor.line_count();
+    let (top_row, count) = layout::block_rows(tree.height, center, total);
+    let gutter = editor_gutter(editor).min(p.width.saturating_sub(6));
+    let text_x = tree.x + p.x + 1 + gutter;
+    let text_w = usize::from(p.width.saturating_sub(1 + gutter)).max(1);
+    let cursor = editor.cursor();
+    let cursor_col = editor.cursor_display_col();
+    let left = cursor_col.saturating_sub(text_w - 1);
+    let digits = usize::from(gutter.saturating_sub(1));
+    for i in 0..usize::from(count) {
+        let index = editor.top() + i;
+        if index >= total {
+            break;
+        }
+        let y = tree.y + top_row + i as u16;
+        let current = index == cursor.line;
+        let number_style = Style::new().fg(theme::rgb(if current { color } else { DIM }));
+        buf.set_stringn(
+            tree.x + p.x + 1,
+            y,
+            format!("{:>digits$} ", index + 1),
+            usize::from(gutter),
+            number_style,
+        );
+        draw_code_line(buf, text_x, y, text_w, left, &editor.styled_line(index));
+        if current {
+            let x = text_x + (cursor_col - left) as u16;
+            if x < tree.x + p.x + p.width && buf.area.contains(ratatui::layout::Position::new(x, y))
+            {
+                let cell = &mut buf[(x, y)];
+                if cell.symbol().trim().is_empty() {
+                    cell.set_char(' ');
+                }
+                let style = if editor.is_insert() {
+                    Style::new().bg(theme::rgb(FG)).fg(theme::rgb(BG))
+                } else {
+                    Style::new().bg(theme::rgb(color)).fg(theme::rgb(BG))
+                };
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
+/// Draws one line of code from display column `left`, expanding tabs and showing control characters as dots.
+fn draw_code_line(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: usize,
+    left: usize,
+    line: &crate::preview::Line,
+) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut col = 0usize;
+    for Span {
+        text,
+        color,
+        bold,
+        italic,
+    } in &line.0
+    {
+        let mut style = Style::new().fg(theme::rgb(*color));
+        if *bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if *italic {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        for g in text.graphemes(true) {
+            let (shown, w) = match g {
+                "\t" => (" ", 4 - col % 4),
+                g if g.chars().any(char::is_control) => ("·", 1),
+                g => (g, g.width().max(1)),
+            };
+            for k in 0..w {
+                let at = col + k;
+                if at >= left && at - left < width {
+                    let cell_x = x + (at - left) as u16;
+                    if !buf.area.contains(ratatui::layout::Position::new(cell_x, y)) {
+                        return;
+                    }
+                    let symbol = if g == "\t" || k > 0 { " " } else { shown };
+                    if k == 0 || g == "\t" {
+                        buf[(cell_x, y)].set_symbol(symbol).set_style(style);
+                    }
+                }
+            }
+            col += w;
+            if col >= left + width {
+                return;
+            }
         }
     }
 }
@@ -1008,5 +1199,97 @@ mod tests {
             "{:?}",
             footer(&lines)
         );
+    }
+
+    fn edit(content: &str) -> (tempfile::TempDir, App) {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("code.rs"), content).unwrap();
+        let mut app = open(tmp.path());
+        keys(&mut app, "i");
+        (tmp, app)
+    }
+
+    #[test]
+    fn the_editor_replaces_the_preview_with_numbered_lines_and_a_cursor() {
+        let (_tmp, mut app) = edit("fn main() {\n    println!(\"hi\");\n}\n");
+        keys(&mut app, "jw");
+        let (lines, buf) = rows(&app, 80, 11);
+        let row = row_of(&lines, "println");
+        assert!(lines[row].contains(" 2     println!"), "{lines:#?}");
+        let col = lines[row].find("println").unwrap();
+        let x = lines[row][..col].chars().count() as u16;
+        assert_ne!(
+            buf[(x, row as u16)].bg,
+            theme::rgb(BG),
+            "the block cursor sits on p"
+        );
+        assert_eq!(buf[(x + 1, row as u16)].bg, theme::rgb(BG));
+        assert!(
+            lines[0].contains("code.rs"),
+            "header names the file: {:?}",
+            lines[0]
+        );
+        assert!(footer(&lines).contains(":w save"), "{:?}", footer(&lines));
+        assert!(
+            footer(&lines).ends_with("2:5"),
+            "position is shown: {:?}",
+            footer(&lines)
+        );
+    }
+
+    #[test]
+    fn edits_mark_the_header_and_insert_mode_shows_in_the_footer() {
+        let (_tmp, mut app) = edit("x\n");
+        keys(&mut app, "A");
+        let (lines, _) = rows(&app, 80, 11);
+        assert!(
+            footer(&lines).starts_with("-- INSERT --"),
+            "{:?}",
+            footer(&lines)
+        );
+        keys(&mut app, "yz");
+        let (lines, _) = rows(&app, 80, 11);
+        assert!(lines[0].trim_end().ends_with("[+]"), "{:?}", lines[0]);
+        assert!(lines.iter().any(|l| l.contains("1 xyz")), "{lines:#?}");
+    }
+
+    #[test]
+    fn the_editor_prompt_takes_the_footer() {
+        let (_tmp, mut app) = edit("x\n");
+        keys(&mut app, ":wq");
+        let (lines, _) = rows(&app, 80, 11);
+        assert_eq!(footer(&lines), ":wq");
+    }
+
+    #[test]
+    fn tabs_expand_to_tab_stops_and_long_lines_scroll_sideways() {
+        let (_tmp, app) = edit("\tindented\n");
+        let (lines, _) = rows(&app, 80, 11);
+        assert!(
+            lines.iter().any(|l| l.contains(" 1     indented")),
+            "{lines:#?}"
+        );
+        let long = format!("start{}end\n", "-".repeat(300));
+        let (_tmp, mut app) = edit(&long);
+        keys(&mut app, "$");
+        let (lines, _) = rows(&app, 80, 11);
+        let row = row_of(&lines, "end");
+        assert!(
+            !lines[row].contains("start"),
+            "scrolled to the end of the line: {:?}",
+            lines[row]
+        );
+        keys(&mut app, "0");
+        let (lines, _) = rows(&app, 80, 11);
+        assert!(lines.iter().any(|l| l.contains("start")));
+    }
+
+    #[test]
+    fn the_editor_fits_tiny_terminals() {
+        let (_tmp, mut app) = edit("some text\nmore\n");
+        keys(&mut app, "A long insert<esc>");
+        for (w, h) in [(1, 1), (5, 3), (12, 4), (30, 6), (200, 60)] {
+            rows(&app, w, h);
+        }
     }
 }

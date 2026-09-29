@@ -11,6 +11,7 @@ use std::{
 use ratatui::crossterm::event::KeyCode;
 
 use crate::{
+    editor::{EditEvent, Editor},
     excmd::{self, Ex},
     fileops::{FileOps, Finished, Job, JobSpec, PasteFlow, Step},
     jumps::Jumps,
@@ -21,7 +22,7 @@ use crate::{
     motion,
     ops::{Choice, NoTrash, Op, Outcome, PasteItem, PasteMode, Trasher, describe, plan_paste},
     prompt::{Prompt, PromptEvent, PromptKind},
-    search,
+    save, search,
 };
 
 /// How the session ended. Only `Quit` should carry the shell to the last directory.
@@ -56,6 +57,8 @@ enum Mode {
         lines: Vec<String>,
         scroll: usize,
     },
+    /// The file under the cursor is open in the built-in editor, which takes every key.
+    Edit(Box<Editor>),
 }
 
 pub struct OverlayView<'a> {
@@ -149,6 +152,27 @@ impl App {
 
     pub fn set_viewport(&mut self, rows: u16) {
         self.viewport = rows;
+        if let Mode::Edit(editor) = &mut self.mode {
+            editor.set_rows(usize::from(rows));
+        }
+    }
+
+    pub fn editor(&self) -> Option<&Editor> {
+        match &self.mode {
+            Mode::Edit(editor) => Some(editor),
+            _ => None,
+        }
+    }
+
+    /// Whether the editor's syntax colors are behind its text.
+    pub fn editor_needs_highlight(&self) -> bool {
+        self.editor().is_some_and(Editor::highlight_stale)
+    }
+
+    pub fn refresh_editor_highlight(&mut self) {
+        if let Mode::Edit(editor) = &mut self.mode {
+            editor.refresh_highlight();
+        }
     }
 
     /// The half-typed normal-mode command, such as `12g`.
@@ -321,6 +345,10 @@ impl App {
                 self.press_overlay(key);
                 Response::default()
             }
+            Mode::Edit(_) => {
+                self.press_edit(key);
+                Response::default()
+            }
             Mode::Normal | Mode::Visual { .. } => self.press_normal(key),
         };
         self.pull_notice();
@@ -444,6 +472,7 @@ impl App {
             Command::Search => self.open_prompt(PromptKind::Search),
             Command::ExPrompt => self.open_prompt(PromptKind::Ex),
             Command::Help => self.open_help(),
+            Command::Edit => self.start_editing(),
             Command::Trash | Command::Yank | Command::Cut => {
                 let operator = command.operator().expect("these are operators");
                 let targets = match self.visual_range() {
@@ -796,6 +825,117 @@ impl App {
             focus_on: None,
             clears_register: false,
         });
+    }
+
+    fn start_editing(&mut self) {
+        let level = self.tree.focused();
+        let Some(entry) = level.selected() else {
+            self.message = Some("nothing to edit".into());
+            return;
+        };
+        if !entry.is_openable() {
+            self.message = Some("only files can be edited, l opens a folder".into());
+            return;
+        }
+        let path = level.dir.join(&entry.name);
+        let loaded = save::fingerprint(&path).and_then(|key| {
+            if key.0 > crate::textbuf::MAX_BYTES as u64 {
+                return Ok(Err(crate::textbuf::LoadError::TooLarge(key.0 as usize)));
+            }
+            Ok(Editor::open(path.clone(), &fs::read(&path)?, key))
+        });
+        match loaded {
+            Ok(Ok(mut editor)) => {
+                editor.set_rows(usize::from(self.viewport));
+                editor.refresh_highlight();
+                self.mode = Mode::Edit(Box::new(editor));
+            }
+            Ok(Err(reason)) => {
+                self.message = Some(format!(
+                    "cannot edit here: {reason}. Enter opens it in your editor"
+                ));
+            }
+            Err(e) => self.message = Some(format!("{}: {e}", path.display())),
+        }
+    }
+
+    fn press_edit(&mut self, key: Key) {
+        let Mode::Edit(editor) = &mut self.mode else {
+            return;
+        };
+        match editor.press(key) {
+            None => {}
+            Some(EditEvent::Close) => self.stop_editing(),
+            Some(EditEvent::Save { force, then_close }) => {
+                if self.save_editor(force) && then_close {
+                    self.stop_editing();
+                }
+            }
+            Some(EditEvent::Reload) => self.reload_editor(),
+        }
+    }
+
+    /// Writes the editor's text to its file. Refuses when something else changed the file since it was opened,
+    /// unless `force` is set.
+    fn save_editor(&mut self, force: bool) -> bool {
+        let Mode::Edit(editor) = &mut self.mode else {
+            return false;
+        };
+        let path = editor.path().to_path_buf();
+        match save::fingerprint(&path) {
+            Ok(now) if now != editor.disk_key() && !force => {
+                editor.message = Some(
+                    "the file changed on disk since you opened it: :w! overwrites, :e! reloads"
+                        .into(),
+                );
+                return false;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !force => {
+                editor.message = Some("the file was deleted: :w! writes it again".into());
+                return false;
+            }
+            _ => {}
+        }
+        let written =
+            save::write_file(&path, &editor.bytes()).and_then(|()| save::fingerprint(&path));
+        match written {
+            Ok(key) => {
+                editor.mark_saved(key);
+                if let Some(dir) = path.parent() {
+                    self.tree.reload(dir);
+                }
+                true
+            }
+            Err(e) => {
+                editor.message = Some(format!("not written: {e}"));
+                false
+            }
+        }
+    }
+
+    fn reload_editor(&mut self) {
+        let Mode::Edit(editor) = &mut self.mode else {
+            return;
+        };
+        let path = editor.path().to_path_buf();
+        let result = save::fingerprint(&path).and_then(|key| Ok((fs::read(&path)?, key)));
+        match result {
+            Ok((bytes, key)) => match editor.reload(&bytes, key) {
+                Ok(()) => editor.message = Some("reloaded from disk".into()),
+                Err(reason) => editor.message = Some(format!("cannot reload: {reason}")),
+            },
+            Err(e) => editor.message = Some(format!("cannot reload: {e}")),
+        }
+        editor.refresh_highlight();
+    }
+
+    fn stop_editing(&mut self) {
+        if let Mode::Edit(editor) = &self.mode
+            && let Some(dir) = editor.path().parent()
+        {
+            self.tree.reload(dir);
+        }
+        self.mode = Mode::Normal;
     }
 
     fn open_help(&mut self) {
@@ -2156,5 +2296,204 @@ mod tests {
         assert_eq!(f.app.message.as_deref(), Some("nothing to rename"));
         f.keys(":chmod 644<cr>");
         assert_eq!(f.app.message.as_deref(), Some("nothing to change"));
+    }
+
+    fn editing(content: &str) -> (tempfile::TempDir, App) {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("notes.txt"), content).unwrap();
+        let mut app = open(root.path());
+        keys(&mut app, "i");
+        (root, app)
+    }
+
+    fn on_disk(root: &tempfile::TempDir) -> String {
+        fs::read_to_string(root.path().join("notes.txt")).unwrap()
+    }
+
+    #[test]
+    fn i_opens_the_file_under_the_cursor_in_the_editor_and_keys_go_to_it() {
+        let (root, mut app) = editing("hello\nworld\n");
+        let editor = app.editor().expect("editing");
+        assert_eq!(editor.path(), root.path().join("notes.txt"));
+        keys(&mut app, "jdd");
+        assert_eq!(
+            app.tree().focused().cursor,
+            0,
+            "j moved the text cursor, not the tree"
+        );
+        assert!(app.editor().unwrap().dirty());
+        assert_eq!(
+            on_disk(&root),
+            "hello\nworld\n",
+            "nothing is written before :w"
+        );
+    }
+
+    #[test]
+    fn colon_w_writes_and_colon_q_returns_to_the_tree() {
+        let (root, mut app) = editing("hello\n");
+        keys(&mut app, "A there<esc>:w<cr>");
+        assert_eq!(on_disk(&root), "hello there\n");
+        assert!(!app.editor().unwrap().dirty());
+        assert!(
+            app.editor()
+                .unwrap()
+                .message
+                .as_deref()
+                .unwrap()
+                .starts_with("written")
+        );
+        keys(&mut app, ":q<cr>");
+        assert!(app.editor().is_none());
+        keys(&mut app, "j");
+        assert!(app.editor().is_none());
+    }
+
+    #[test]
+    fn colon_wq_and_zz_save_and_close() {
+        let (root, mut app) = editing("a\n");
+        keys(&mut app, "ob<esc>:wq<cr>");
+        assert_eq!(on_disk(&root), "a\nb\n");
+        assert!(app.editor().is_none());
+        keys(&mut app, "iddZZ");
+        assert_eq!(on_disk(&root), "b\n");
+        assert!(app.editor().is_none());
+    }
+
+    #[test]
+    fn unsaved_changes_block_colon_q_until_colon_q_bang() {
+        let (root, mut app) = editing("keep\n");
+        keys(&mut app, "dd:q<cr>");
+        assert!(app.editor().is_some());
+        keys(&mut app, ":q!<cr>");
+        assert!(app.editor().is_none());
+        assert_eq!(on_disk(&root), "keep\n");
+    }
+
+    #[test]
+    fn a_file_changed_elsewhere_is_not_overwritten_without_bang() {
+        let (root, mut app) = editing("mine\n");
+        keys(&mut app, "Ax<esc>");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(root.path().join("notes.txt"), "someone else wrote this\n").unwrap();
+        keys(&mut app, ":w<cr>");
+        assert_eq!(on_disk(&root), "someone else wrote this\n");
+        let message = app.editor().unwrap().message.clone().unwrap();
+        assert!(message.contains("changed on disk"), "{message}");
+        keys(&mut app, ":e!<cr>");
+        assert!(!app.editor().unwrap().dirty());
+        keys(&mut app, "Ay<esc>:w<cr>");
+        assert_eq!(on_disk(&root), "someone else wrote thisy\n");
+    }
+
+    #[test]
+    fn colon_w_bang_overwrites_a_file_changed_elsewhere() {
+        let (root, mut app) = editing("mine\n");
+        keys(&mut app, "Ax<esc>");
+        fs::write(root.path().join("notes.txt"), "theirs, longer\n").unwrap();
+        keys(&mut app, ":w!<cr>");
+        assert_eq!(on_disk(&root), "minex\n");
+    }
+
+    #[test]
+    fn a_deleted_file_is_only_written_again_with_bang() {
+        let (root, mut app) = editing("text\n");
+        fs::remove_file(root.path().join("notes.txt")).unwrap();
+        keys(&mut app, ":w<cr>");
+        assert!(
+            app.editor()
+                .unwrap()
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("deleted")
+        );
+        assert!(!root.path().join("notes.txt").exists());
+        keys(&mut app, ":w!<cr>");
+        assert_eq!(on_disk(&root), "text\n");
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_editor_open_with_the_reason() {
+        let (root, mut app) = editing("text\n");
+        let path = root.path().join("notes.txt");
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o444)).unwrap();
+        fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o555),
+        )
+        .unwrap();
+        keys(&mut app, "x:wq<cr>");
+        fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        if std::os::unix::fs::MetadataExt::uid(&fs::metadata("/proc/self").unwrap()) == 0 {
+            return;
+        }
+        assert!(app.editor().is_some(), "a failed :wq does not close");
+        let message = app.editor().unwrap().message.clone().unwrap();
+        assert!(message.starts_with("not written"), "{message}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "text\n");
+    }
+
+    #[test]
+    fn directories_binaries_and_huge_files_are_refused_with_a_reason() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("adir")).unwrap();
+        fs::write(root.path().join("bin"), b"\x7fELF\0\0").unwrap();
+        fs::write(
+            root.path().join("big"),
+            vec![b'a'; crate::textbuf::MAX_BYTES + 1],
+        )
+        .unwrap();
+        let mut app = open(root.path());
+        keys(&mut app, "i");
+        assert!(app.editor().is_none());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("only files can be edited, l opens a folder")
+        );
+        keys(&mut app, "ji");
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("more than the 2 MB"),
+            "{:?}",
+            app.message
+        );
+        keys(&mut app, "ji");
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("not a UTF-8 text file"),
+            "{:?}",
+            app.message
+        );
+        assert!(app.editor().is_none());
+    }
+
+    #[test]
+    fn the_preview_shows_the_saved_text_after_closing() {
+        let (_root, mut app) = editing("before\n");
+        keys(&mut app, "ccafter<esc>:wq<cr>");
+        app.settle();
+        let preview = app.tree().preview().expect("a preview of the file");
+        let crate::model::PreviewState::Ready(content) = &preview.state else {
+            panic!("preview not ready")
+        };
+        assert_eq!(content.lines[0].text(), "after");
+    }
+
+    #[test]
+    fn the_editor_scrolls_with_the_terminal_height() {
+        let body: String = (0..200).map(|i| format!("{i}\n")).collect();
+        let (_root, mut app) = editing(&body);
+        app.set_viewport(20);
+        keys(&mut app, "G");
+        assert_eq!(app.editor().unwrap().top(), 180);
     }
 }

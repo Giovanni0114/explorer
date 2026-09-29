@@ -168,6 +168,7 @@ pub enum Command {
     FindRepeatBack,
     ExPrompt,
     Help,
+    Edit,
     Trash,
     Yank,
     Cut,
@@ -309,6 +310,11 @@ pub const COMMANDS: &[CommandInfo] = &[
     info("ex", Command::ExPrompt, "open the command line"),
     info("help", Command::Help, "show this help"),
     info(
+        "edit",
+        Command::Edit,
+        "edit the file here, with vim keys (:w saves, :q closes)",
+    ),
+    info(
         "trash",
         Command::Trash,
         "move entries to the trash, like d{motion}; dd is this entry",
@@ -418,6 +424,7 @@ const DEFAULT_KEYS: &[(&str, &str)] = &[
     (",", "find_repeat_back"),
     (":", "ex"),
     ("?", "help"),
+    ("i", "edit"),
     ("d", "trash"),
     ("y", "yank"),
     ("x", "cut"),

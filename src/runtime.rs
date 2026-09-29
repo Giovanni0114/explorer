@@ -43,6 +43,8 @@ const PREVIEW_WORKERS: usize = 2;
 const CHANGE_DEBOUNCE: Duration = Duration::from_millis(50);
 /// How often to redraw while a listing is slow, so "(loading…)" can appear.
 const LOADING_TICK: Duration = Duration::from_millis(100);
+/// Syntax colors are redone once typing pauses this long, so fast typing never waits on them.
+const HIGHLIGHT_IDLE: Duration = Duration::from_millis(60);
 
 enum Msg {
     Input(Event),
@@ -87,6 +89,7 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
         let wait = [
             flush_at.map(|t| t.saturating_duration_since(Instant::now())),
             app.tree().is_loading().then_some(LOADING_TICK),
+            app.editor_needs_highlight().then_some(HIGHLIGHT_IDLE),
         ]
         .into_iter()
         .flatten()
@@ -94,7 +97,10 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
         let first = match wait {
             Some(wait) => match rx.recv_timeout(wait) {
                 Ok(msg) => Some(msg),
-                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Timeout) => {
+                    app.refresh_editor_highlight();
+                    None
+                }
                 Err(RecvTimeoutError::Disconnected) => return Ok(Exit::Abort),
             },
             None => match rx.recv() {
