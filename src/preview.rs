@@ -267,8 +267,157 @@ fn image_target() -> (u32, u32) {
     )
 }
 
+/// How much of a picture's header is read when looking for the camera's own preview. Cameras put
+/// their previews in the first application segments, comfortably inside this.
+const PREVIEW_SCAN_BYTES: u64 = 256 * 1024;
+
+/// Whether a picture of this size can fill a `width` by `height` box without being enlarged.
+/// Fitting keeps the shape, so covering the box in either direction is enough.
+fn covers(size: (u32, u32), width: u32, height: u32) -> bool {
+    size.0 >= width || size.1 >= height
+}
+
+/// Walks the segments of a JPEG up to the start of its image data. Everything before that is
+/// header, and that is where cameras keep their previews.
+fn header_end(data: &[u8]) -> usize {
+    let mut at = 2usize;
+    while at + 4 <= data.len() {
+        if data[at] != 0xFF {
+            at += 1;
+            continue;
+        }
+        let marker = data[at + 1];
+        // Padding, and markers that carry no length.
+        if marker == 0xFF || marker == 0x01 || (0xD0..=0xD8).contains(&marker) {
+            at += 2;
+            continue;
+        }
+        // Start of scan: the compressed picture begins here.
+        if marker == 0xDA {
+            return at;
+        }
+        let len = usize::from(u16::from_be_bytes([data[at + 2], data[at + 3]]));
+        if len < 2 {
+            return at;
+        }
+        at += 2 + len;
+    }
+    data.len()
+}
+
+/// The width and height a JPEG declares in its frame header.
+fn jpeg_size(data: &[u8]) -> Option<(u32, u32)> {
+    let mut at = 2usize;
+    while at + 9 <= data.len() {
+        if data[at] != 0xFF {
+            at += 1;
+            continue;
+        }
+        let marker = data[at + 1];
+        if marker == 0xFF || marker == 0x01 || (0xD0..=0xD8).contains(&marker) {
+            at += 2;
+            continue;
+        }
+        if marker == 0xDA {
+            return None;
+        }
+        let len = usize::from(u16::from_be_bytes([data[at + 2], data[at + 3]]));
+        if len < 2 {
+            return None;
+        }
+        // The frame headers that carry the picture's size, baseline through progressive.
+        if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            let h = u32::from(u16::from_be_bytes([data[at + 5], data[at + 6]]));
+            let w = u32::from(u16::from_be_bytes([data[at + 7], data[at + 8]]));
+            return Some((w, h));
+        }
+        at += 2 + len;
+    }
+    None
+}
+
+/// The largest finished picture stored in a JPEG's header. Cameras keep a small thumbnail there and
+/// usually a larger preview beside it, each a complete JPEG of the same photo.
+fn embedded_preview(head: &[u8]) -> Option<&[u8]> {
+    let end = header_end(head);
+    let mut best: Option<(&[u8], u32)> = None;
+    let mut at = 2usize;
+    while at + 3 <= end {
+        if head[at..at + 3] != *b"\xFF\xD8\xFF" {
+            at += 1;
+            continue;
+        }
+        // A preview that runs past the bytes read is no use, so stop rather than guess.
+        let Some(stop) = head[at..end]
+            .windows(2)
+            .position(|w| w == b"\xFF\xD9")
+            .map(|e| at + e + 2)
+        else {
+            break;
+        };
+        let candidate = &head[at..stop];
+        if let Some((w, h)) = jpeg_size(candidate)
+            && best.is_none_or(|(_, pixels)| w * h > pixels)
+        {
+            best = Some((candidate, w * h));
+        }
+        at = stop;
+    }
+    best.map(|(bytes, _)| bytes)
+}
+
+/// Reads a picture's header and decodes the preview the camera stored in it, with the orientation
+/// the photo asks for. About a millisecond, where the real image data costs hundreds.
+fn header_preview(path: &Path) -> Option<(Vec<u8>, image::DynamicImage)> {
+    let mut head = Vec::with_capacity(PREVIEW_SCAN_BYTES as usize);
+    File::open(path)
+        .ok()?
+        .take(PREVIEW_SCAN_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
+    // Only JPEG carries these, and scanning anything else is wasted work.
+    if !head.starts_with(b"\xFF\xD8\xFF") {
+        return None;
+    }
+    let mut image = image::load_from_memory(embedded_preview(&head)?).ok()?;
+    // The orientation flag describes the photo, and the preview is stored the same way round.
+    if let Some(orientation) = image::ImageReader::new(io::Cursor::new(&head))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_decoder().ok())
+        .and_then(|mut d| d.orientation().ok())
+    {
+        image.apply_orientation(orientation);
+    }
+    Some((head, image))
+}
+
+/// The camera's own preview, shown at once while the real picture is still being decoded. `None`
+/// when the file has no preview, or when it has one big enough that [`build`] is already instant.
+pub fn build_quick(path: &Path) -> Option<Content> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let (width, height) = image_target();
+    let (head, image) = header_preview(path)?;
+    if covers((image.width(), image.height()), width, height) {
+        return None;
+    }
+    let image = ImageData(std::sync::Arc::new(image));
+    Some(image_content(&head, &meta, image))
+}
+
 fn decode_image(path: &Path) -> Result<ImageData, String> {
     let (width, height) = image_target();
+    // A preview the camera already made beats decoding forty megapixels, when it is big enough.
+    if let Some((_, image)) = header_preview(path)
+        && covers((image.width(), image.height()), width, height)
+    {
+        return Ok(ImageData(std::sync::Arc::new(
+            image.thumbnail(width, height),
+        )));
+    }
     let reader = image::ImageReader::open(path)
         .and_then(|r| r.with_guessed_format())
         .map_err(|e| e.to_string())?;
@@ -638,6 +787,93 @@ mod tests {
             content.lines[MAX_LINES - 1].text(),
             format!("line {}", MAX_LINES - 1)
         );
+    }
+
+    /// A flat JPEG of one colour, the size asked for.
+    fn jpeg(width: u32, height: u32, color: [u8; 3]) -> Vec<u8> {
+        let picture = image::RgbImage::from_pixel(width, height, image::Rgb(color));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(picture)
+            .write_to(&mut io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+            .unwrap();
+        bytes
+    }
+
+    /// A photo with a smaller picture of itself in an APP1 segment, the way a camera stores its
+    /// preview. The two are different colours here, so tests can tell which one was decoded.
+    fn photo_with_preview() -> Vec<u8> {
+        let (outer, inner) = (
+            jpeg(1200, 900, [220, 20, 20]),
+            jpeg(600, 450, [20, 20, 220]),
+        );
+        let mut out = outer[..2].to_vec();
+        out.extend_from_slice(b"\xFF\xE1");
+        out.extend_from_slice(&(u16::try_from(inner.len() + 2).unwrap()).to_be_bytes());
+        out.extend_from_slice(&inner);
+        out.extend_from_slice(&outer[2..]);
+        out
+    }
+
+    /// The image target is process-wide, so the tests that set it take turns.
+    fn with_target<T>(width: u32, height: u32, body: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_image_target(width, height);
+        let out = body();
+        set_image_target(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE);
+        out
+    }
+
+    fn is_blue(image: &ImageData) -> bool {
+        let p = image.0.to_rgb8();
+        let [r, _, b] = p.get_pixel(p.width() / 2, p.height() / 2).0;
+        b > r
+    }
+
+    #[test]
+    fn a_cameras_own_preview_is_used_when_it_fills_the_column() {
+        let (_t, path) = file("photo.jpg", &photo_with_preview());
+        // The 600x450 preview covers a 400x300 column, so the 1200x900 photo is never decoded.
+        let image = with_target(400, 300, || build(&path).unwrap().image.unwrap());
+        assert!(is_blue(&image), "the embedded preview, not the photo");
+        assert!(
+            with_target(400, 300, || build_quick(&path)).is_none(),
+            "nothing to refine when the preview already fills the column"
+        );
+    }
+
+    #[test]
+    fn a_preview_too_small_for_the_column_is_shown_first_and_then_replaced() {
+        let (_t, path) = file("photo.jpg", &photo_with_preview());
+        let quick = with_target(1000, 800, || build_quick(&path))
+            .expect("a first paint from the header")
+            .image
+            .unwrap();
+        assert!(is_blue(&quick), "the embedded preview");
+        assert_eq!((quick.0.width(), quick.0.height()), (600, 450));
+        let full = with_target(1000, 800, || build(&path).unwrap().image.unwrap());
+        assert!(!is_blue(&full), "the real photo replaces it");
+        assert_eq!((full.0.width(), full.0.height()), (1000, 750));
+    }
+
+    #[test]
+    fn a_picture_without_an_embedded_preview_has_no_first_paint() {
+        let (_t, path) = file("plain.jpg", &jpeg(1200, 900, [220, 20, 20]));
+        assert!(with_target(1000, 800, || build_quick(&path)).is_none());
+        let (_t, path) = file("plain.png", &png(64, 32));
+        assert!(with_target(1000, 800, || build_quick(&path)).is_none());
+    }
+
+    #[test]
+    fn a_header_that_is_not_a_picture_is_left_alone() {
+        assert_eq!(
+            header_end(b"\xFF\xD8\xFF"),
+            3,
+            "stops at the end of what it has"
+        );
+        assert!(embedded_preview(b"not a jpeg at all").is_none());
+        // A length that would step backwards must not loop for ever.
+        assert!(embedded_preview(b"\xFF\xD8\xFF\xE1\x00\x00rest").is_none());
     }
 
     #[test]
