@@ -637,3 +637,56 @@ fn clicking_and_scrolling_with_the_mouse() {
     click(&mut s, col, row);
     s.wait_for_text(":w save");
 }
+
+#[test]
+fn the_terminal_is_asked_what_it_can_draw_and_its_answer_is_used() {
+    let tmp = fixture();
+    let mut s = Session::spawn_with(
+        tmp.path(),
+        Opts {
+            config: Some("images = \"auto\"\n"),
+            terminal_answers: Some(b"\x1bP>|foot(1.16.2)\x1b\\\x1b[6;18;9t\x1b[?62;4;22c"),
+            env: vec![("TERM", "xterm-256color".to_string())],
+            ..Opts::default()
+        },
+    );
+    s.wait_for_text("apps/");
+    s.send(":images\r");
+    let rows = s.wait_for_text("pictures:");
+    let footer = rows.last().unwrap();
+    assert!(
+        footer.contains("sixel") && footer.contains("foot(1.16.2)"),
+        "{footer:?}"
+    );
+}
+
+#[test]
+fn a_terminal_that_never_answers_costs_only_the_timeout_and_no_keys() {
+    let tmp = fixture();
+    let started = std::time::Instant::now();
+    let mut s = Session::spawn_with(
+        tmp.path(),
+        Opts {
+            config: Some("images = \"auto\"\n"),
+            env: vec![("TERM", "xterm-256color".to_string())],
+            ..Opts::default()
+        },
+    );
+    s.wait_for_text("apps/");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    s.send("j");
+    s.wait("the first key after start works", |r| {
+        center(r).contains("notes/")
+    });
+    s.send(":images\r");
+    let rows = s.wait_for_text("pictures:");
+    assert!(
+        rows.last().unwrap().contains("quadrant blocks"),
+        "{:?}",
+        rows.last()
+    );
+}

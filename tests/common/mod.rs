@@ -17,7 +17,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Session {
     child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     parser: Arc<Mutex<vt100::Parser>>,
     _master: Box<dyn MasterPty + Send>,
     _home: tempfile::TempDir,
@@ -27,6 +27,8 @@ pub struct Session {
 #[derive(Default)]
 pub struct Opts<'a> {
     pub config: Option<&'a str>,
+    /// What the terminal replies when the program asks about it, as a real terminal would.
+    pub terminal_answers: Option<&'static [u8]>,
     pub args: Vec<String>,
     pub env: Vec<(&'a str, String)>,
 }
@@ -75,19 +77,32 @@ impl Session {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
         let mut reader = pair.master.try_clone_reader().unwrap();
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
         let sink = Arc::clone(&parser);
+        let replier = Arc::clone(&writer);
+        let mut answers = opts.terminal_answers;
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            let mut seen = Vec::new();
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
                 sink.lock().unwrap().process(&buf[..n]);
+                if let Some(reply) = answers {
+                    seen.extend_from_slice(&buf[..n]);
+                    if seen.windows(3).any(|w| w == b"\x1b[c") {
+                        let mut w = replier.lock().unwrap();
+                        w.write_all(reply).unwrap();
+                        w.flush().unwrap();
+                        answers = None;
+                    }
+                }
             }
         });
         Session {
             child,
-            writer: pair.master.take_writer().unwrap(),
+            writer,
             parser,
             _master: pair.master,
             _home: home,
@@ -101,8 +116,9 @@ impl Session {
     }
 
     pub fn send(&mut self, bytes: &str) {
-        self.writer.write_all(bytes.as_bytes()).unwrap();
-        self.writer.flush().unwrap();
+        let mut writer = self.writer.lock().unwrap();
+        writer.write_all(bytes.as_bytes()).unwrap();
+        writer.flush().unwrap();
     }
 
     pub fn rows(&self) -> Vec<String> {

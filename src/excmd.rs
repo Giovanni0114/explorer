@@ -17,6 +17,8 @@ pub enum Ex {
     Chmod(u32),
     Undo,
     Redo,
+    /// Says how pictures are drawn and why.
+    Images,
 }
 
 /// Parses one command line. `cwd` resolves relative paths and `home` expands a leading `~`.
@@ -32,6 +34,7 @@ pub fn parse(line: &str, cwd: &Path, home: Option<&Path>) -> Result<Ex, String> 
         "cd" => Ok(Ex::Cd(resolve(arg, cwd, home))),
         "marks" => Ok(Ex::Marks),
         "undo" => Ok(Ex::Undo),
+        "images" => Ok(Ex::Images),
         "redo" => Ok(Ex::Redo),
         "mkdir" if !arg.is_empty() => Ok(Ex::Mkdir(arg.to_string())),
         "touch" if !arg.is_empty() => Ok(Ex::Touch(arg.to_string())),

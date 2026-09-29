@@ -10,6 +10,7 @@ use tx::{
     ops::SystemTrash,
     runtime,
     shell::{self, Shell},
+    termquery,
     theme::Depth,
 };
 
@@ -53,7 +54,15 @@ fn main() -> io::Result<()> {
     } else {
         config.images
     };
-    let painter = Painter::new(images);
+    let mut terminal = ratatui::init();
+    // Asked in raw mode and before the input thread starts, so the answers are not taken for keys.
+    let answers = if images == ImageMode::Auto {
+        let in_tmux = std::env::var_os("TMUX").is_some();
+        termquery::ask(in_tmux, std::time::Duration::from_millis(500)).ok()
+    } else {
+        None
+    };
+    let painter = Painter::new(images, answers.as_ref());
     let settings = Settings {
         show_hidden: config.show_hidden,
         tree_width: config.tree_width,
@@ -64,7 +73,6 @@ fn main() -> io::Result<()> {
     };
     let mut app = App::with_settings(root, keymap, settings);
     app.message = notice;
-    let mut terminal = ratatui::init();
     if config.mouse {
         ratatui::crossterm::execute!(io::stdout(), ratatui::crossterm::event::EnableMouseCapture)?;
         // ratatui's own panic hook restores the screen but not mouse reporting, which would keep flooding the shell.

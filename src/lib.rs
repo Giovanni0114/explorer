@@ -23,5 +23,6 @@ pub mod runtime;
 pub mod save;
 pub mod search;
 pub mod shell;
+pub mod termquery;
 pub mod textbuf;
 pub mod theme;

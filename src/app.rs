@@ -113,7 +113,7 @@ impl Default for Settings {
     fn default() -> Settings {
         Settings {
             show_hidden: false,
-            painter: Painter::halfblocks(),
+            painter: Painter::blocks(),
             depth: crate::theme::Depth::TrueColor,
             tree_width: 50,
             marks: Marks::default(),
@@ -1301,6 +1301,7 @@ impl App {
             Ok(Ex::Abort) => return exit(Exit::Abort),
             Ok(Ex::Help) => self.open_help(),
             Ok(Ex::Marks) => self.open_marks(),
+            Ok(Ex::Images) => self.message = Some(self.painter.describe()),
             Ok(Ex::Undo) => self.report(FileOps::undo),
             Ok(Ex::Redo) => self.report(FileOps::redo),
             Ok(Ex::Mkdir(name)) => self.create_entry(&name, true),
@@ -2790,5 +2791,13 @@ mod tests {
         keys(&mut app, "/notes<cr>l");
         app.mouse(MouseAction::ScrollDown, 80, 5);
         assert_eq!(app.editor().unwrap().cursor().line, 3);
+    }
+
+    #[test]
+    fn colon_images_says_how_pictures_are_drawn() {
+        let tmp = fixture();
+        let mut app = open(tmp.path());
+        keys(&mut app, ":images<cr>");
+        assert_eq!(app.message.as_deref(), Some("pictures: quadrant blocks"));
     }
 }
