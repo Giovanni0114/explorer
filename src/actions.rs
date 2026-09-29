@@ -29,7 +29,7 @@ pub enum Opener {
     Desktop(Command),
 }
 
-/// Text files go to the configured editor, everything else to `xdg-open`.
+/// Text files go to the configured editor, everything else to `open` (macOS) or `xdg-open`.
 pub fn opener_for(path: &Path, config: &Config) -> Result<Opener, String> {
     let text = is_text(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if text {
@@ -40,10 +40,15 @@ pub fn opener_for(path: &Path, config: &Config) -> Result<Opener, String> {
         command.args(&argv[1..]).arg(path);
         return Ok(Opener::Editor(command));
     }
-    if !on_path("xdg-open") {
-        return Err("xdg-open not found".into());
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    if !on_path(opener) {
+        return Err(format!("{opener} not found"));
     }
-    let mut command = Command::new("xdg-open");
+    let mut command = Command::new(opener);
     command
         .arg(path)
         .stdin(Stdio::null())

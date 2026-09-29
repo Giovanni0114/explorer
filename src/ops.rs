@@ -46,6 +46,7 @@ pub trait Trasher: Send + Sync {
 /// The freedesktop trash of the current user.
 pub struct SystemTrash;
 
+#[cfg(not(target_os = "macos"))]
 impl Trasher for SystemTrash {
     fn trash(&self, path: &Path) -> io::Result<TrashRef> {
         trash::delete(path).map_err(io::Error::other)?;
@@ -74,6 +75,57 @@ impl Trasher for SystemTrash {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no longer in the trash"))?;
         trash::os_limited::restore_all([found]).map_err(io::Error::other)
     }
+}
+
+/// `~/.Trash`; the `trash` crate cannot list or restore there, so the entry is found by name.
+// ponytail: home volume only, an external drive's `.Trashes` is not searched.
+#[cfg(target_os = "macos")]
+impl Trasher for SystemTrash {
+    fn trash(&self, path: &Path) -> io::Result<TrashRef> {
+        trash::delete(path).map_err(io::Error::other)?;
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        // Finder appends " HH.MM.SS" to a name that is already taken, before the extension.
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let ext = &name[stem.len()..];
+        let newest = fs::read_dir(macos_trash_dir()?)?
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n == name || (n.starts_with(&format!("{stem} ")) && n.ends_with(ext))
+            })
+            .filter_map(|e| Some((e.metadata().ok()?.ctime(), e.path())))
+            .max_by_key(|(ctime, _)| *ctime);
+        newest
+            .map(|(_, found)| TrashRef {
+                id: found.into_os_string(),
+                original: path.to_path_buf(),
+            })
+            .ok_or_else(|| io::Error::other("moved to the trash, but cannot find it there to undo"))
+    }
+
+    fn restore(&self, item: &TrashRef) -> io::Result<()> {
+        let from = Path::new(&item.id);
+        if !from.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no longer in the trash",
+            ));
+        }
+        if fs::symlink_metadata(&item.original).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "something else is there now",
+            ));
+        }
+        fs::rename(from, &item.original)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_trash_dir() -> io::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".Trash"))
+        .ok_or_else(|| io::Error::other("HOME is not set"))
 }
 
 /// For builds and tests where no trash may be touched.

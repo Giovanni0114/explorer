@@ -66,12 +66,25 @@ impl Session {
         cmd.arg(root);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("HOME", home.path());
+        // macOS trashes into the real ~/.Trash whatever HOME says, so undo must look there too.
+        if cfg!(not(target_os = "macos")) {
+            cmd.env("HOME", home.path());
+        }
         cmd.env("XDG_CONFIG_HOME", &config_dir);
         cmd.env("XDG_STATE_HOME", home.path().join("state"));
         // The machine running the tests may itself be reached over SSH, which changes how long the
         // program waits for the terminal. Tests that want SSH say so in `env`.
-        for name in ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"] {
+        // Nor should the terminal running the tests leak in and decide the picture protocol.
+        for name in [
+            "SSH_CONNECTION",
+            "SSH_TTY",
+            "SSH_CLIENT",
+            "TERM_PROGRAM",
+            "LC_TERMINAL",
+            "ITERM_SESSION_ID",
+            "KITTY_WINDOW_ID",
+            "WEZTERM_EXECUTABLE",
+        ] {
             cmd.env_remove(name);
         }
         for (k, v) in &opts.env {
@@ -116,6 +129,7 @@ impl Session {
     }
 
     /// The home directory the app runs with, where its trash lives.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn home(&self) -> &Path {
         self._home.path()
     }

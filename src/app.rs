@@ -2612,7 +2612,7 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .unwrap();
-        if std::os::unix::fs::MetadataExt::uid(&fs::metadata("/proc/self").unwrap()) == 0 {
+        if std::os::unix::fs::MetadataExt::uid(&fs::metadata(root.path()).unwrap()) == 0 {
             return;
         }
         assert!(app.editor().is_some(), "a failed :wq does not close");

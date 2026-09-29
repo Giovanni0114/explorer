@@ -3,6 +3,7 @@ mod common;
 use common::*;
 
 /// Everything but the header and footer lines.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn tree_rows(rows: &[String]) -> &[String] {
     &rows[1..rows.len() - 1]
 }
@@ -293,10 +294,12 @@ fn ctrl_o_returns_to_where_a_jump_started() {
     s.wait("forward on README", |r| center(r).contains("README.md"));
 }
 
+#[cfg(target_os = "linux")]
 fn trash_files(s: &Session) -> std::path::PathBuf {
     s.home().join(".local/share/Trash/files")
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn dd_moves_a_file_to_the_real_trash_and_u_brings_it_back() {
     let tmp = fixture();

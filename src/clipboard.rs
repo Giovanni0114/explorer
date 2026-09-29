@@ -1,15 +1,6 @@
 //! Puts yanked files on the desktop clipboard so a GUI file manager can paste them.
 
-use std::{
-    env,
-    io::{self, Write},
-    os::unix::ffi::OsStrExt,
-    path::PathBuf,
-    process::{Command, Stdio},
-    thread,
-};
-
-use crate::config::on_path;
+use std::{io, os::unix::ffi::OsStrExt, path::PathBuf, process::Command};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Payload {
@@ -46,8 +37,34 @@ fn uri(path: &std::path::Path) -> String {
     out
 }
 
+/// Puts the files on the pasteboard as Finder does: an AppleScript list of POSIX files.
+#[cfg(target_os = "macos")]
+pub fn copy_to_system(paths: &[PathBuf], _cut: bool) -> io::Result<()> {
+    let files: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            let p = p
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            format!("POSIX file \"{p}\"")
+        })
+        .collect();
+    let script = format!("set the clipboard to {{{}}}", files.join(", "));
+    let status = Command::new("osascript").args(["-e", &script]).status()?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| io::Error::other("osascript failed"))
+}
+
 /// Hands the files to `wl-copy` or `xclip`, whichever fits the session.
+#[cfg(not(target_os = "macos"))]
 pub fn copy_to_system(paths: &[PathBuf], cut: bool) -> io::Result<()> {
+    use std::{env, io::Write, process::Stdio, thread};
+
+    use crate::config::on_path;
+
     let gnome = env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.to_uppercase().contains("GNOME"));
     let payload = payload(paths, cut, gnome);
     let mut command = if env::var_os("WAYLAND_DISPLAY").is_some() && on_path("wl-copy") {
