@@ -178,6 +178,27 @@ pub enum Command {
 }
 
 impl Command {
+    /// Commands that only move the cursor, so an operator can take them as its range.
+    pub fn is_motion(self) -> bool {
+        matches!(
+            self,
+            Command::Down
+                | Command::Up
+                | Command::First
+                | Command::Last
+                | Command::HalfPageDown
+                | Command::HalfPageUp
+                | Command::PageDown
+                | Command::PageUp
+                | Command::SearchNext
+                | Command::SearchPrev
+                | Command::Find
+                | Command::FindBack
+                | Command::FindRepeat
+                | Command::FindRepeatBack
+        )
+    }
+
     /// Commands that read one more key as their argument, like vim's `f{char}`.
     pub fn wants_char(self) -> bool {
         matches!(

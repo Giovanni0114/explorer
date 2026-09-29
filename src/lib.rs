@@ -9,6 +9,7 @@ pub mod layout;
 pub mod lineedit;
 pub mod marks;
 pub mod model;
+pub mod motion;
 pub mod preview;
 pub mod prompt;
 pub mod render;

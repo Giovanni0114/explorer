@@ -11,6 +11,7 @@ use crate::{
     lineedit::LineEditor,
     marks::Marks,
     model::{Effect, Tree},
+    motion,
     prompt::{Prompt, PromptEvent, PromptKind},
     search,
 };
@@ -207,6 +208,25 @@ impl App {
         response
     }
 
+    /// Moves the focused cursor with a motion. Nothing found leaves the cursor and says why.
+    fn motion(&mut self, command: Command, count: Option<usize>, arg: Option<char>) {
+        if let (Command::Find | Command::FindBack, Some(letter)) = (command, arg) {
+            self.last_find = Some((letter, command == Command::Find));
+        }
+        let level = self.tree.focused();
+        let ctx = motion::Ctx {
+            entries: &level.entries,
+            cursor: level.cursor,
+            viewport: self.viewport,
+            last_search: self.last_search.as_deref(),
+            last_find: self.last_find,
+        };
+        match motion::target(command, count, arg, &ctx) {
+            Ok(index) => self.tree.set_cursor(index),
+            Err(message) => self.message = Some(message),
+        }
+    }
+
     fn remember_jump(&mut self, from: PathBuf) {
         self.jumps.record(from.clone());
         self.previous = Some(from);
@@ -215,24 +235,21 @@ impl App {
     fn execute(&mut self, command: Command, count: Option<usize>, arg: Option<char>) -> Response {
         let n = count.unwrap_or(1);
         let step = isize::try_from(n).unwrap_or(isize::MAX);
-        let half = isize::try_from(self.viewport / 2).unwrap_or(1).max(1);
-        let page = isize::try_from(self.viewport)
-            .unwrap_or(1)
-            .saturating_sub(2)
-            .max(1);
         match command {
-            Command::Down => self.tree.move_by(step),
-            Command::Up => self.tree.move_by(-step),
-            Command::First => self
-                .tree
-                .set_cursor(count.map_or(0, |c| c.saturating_sub(1))),
-            Command::Last => self
-                .tree
-                .set_cursor(count.map_or(usize::MAX, |c| c.saturating_sub(1))),
-            Command::HalfPageDown => self.tree.move_by(half.saturating_mul(step)),
-            Command::HalfPageUp => self.tree.move_by(-half.saturating_mul(step)),
-            Command::PageDown => self.tree.move_by(page.saturating_mul(step)),
-            Command::PageUp => self.tree.move_by(-page.saturating_mul(step)),
+            Command::Down
+            | Command::Up
+            | Command::First
+            | Command::Last
+            | Command::HalfPageDown
+            | Command::HalfPageUp
+            | Command::PageDown
+            | Command::PageUp
+            | Command::SearchNext
+            | Command::SearchPrev
+            | Command::Find
+            | Command::FindBack
+            | Command::FindRepeat
+            | Command::FindRepeatBack => self.motion(command, count, arg),
             Command::PreviewDown => self.tree.scroll_preview(step, usize::from(self.viewport)),
             Command::PreviewUp => self.tree.scroll_preview(-step, usize::from(self.viewport)),
             Command::Enter => {
@@ -252,23 +269,6 @@ impl App {
             Command::Leave => (0..n.min(MAX_REPEAT)).for_each(|_| self.tree.leave()),
             Command::Search => self.open_prompt(PromptKind::Search),
             Command::ExPrompt => self.open_prompt(PromptKind::Ex),
-            Command::SearchNext | Command::SearchPrev => match self.last_search.clone() {
-                Some(query) => self.jump_to_match(&query, command == Command::SearchNext, n),
-                None => self.message = Some("no previous search".into()),
-            },
-            Command::Find | Command::FindBack => {
-                if let Some(c) = arg {
-                    let forward = command == Command::Find;
-                    self.last_find = Some((c, forward));
-                    self.jump_to_initial(c, forward, n);
-                }
-            }
-            Command::FindRepeat | Command::FindRepeatBack => match self.last_find {
-                Some((c, forward)) => {
-                    self.jump_to_initial(c, forward == (command == Command::FindRepeat), n);
-                }
-                None => self.message = Some("no previous letter jump".into()),
-            },
             Command::Help => self.open_help(),
             Command::SetMark => {
                 if let Some(name) = arg {
@@ -463,8 +463,8 @@ impl App {
             self.remember_jump(origin);
         }
         if query.is_empty() {
-            if let Some(last) = self.last_search.clone() {
-                self.jump_to_match(&last, true, 1);
+            if self.last_search.is_some() {
+                self.motion(Command::SearchNext, None, None);
             }
             return;
         }
@@ -473,32 +473,6 @@ impl App {
             self.message = Some(format!("pattern not found: {query}"));
         }
         self.last_search = Some(query.to_string());
-    }
-
-    fn jump_to_match(&mut self, query: &str, forward: bool, times: usize) {
-        for _ in 0..times.min(MAX_REPEAT) {
-            let level = self.tree.focused();
-            match search::find(&level.entries, query, level.cursor, forward, false) {
-                Some(i) => self.tree.set_cursor(i),
-                None => {
-                    self.message = Some(format!("pattern not found: {query}"));
-                    return;
-                }
-            }
-        }
-    }
-
-    fn jump_to_initial(&mut self, initial: char, forward: bool, times: usize) {
-        for _ in 0..times.min(MAX_REPEAT) {
-            let level = self.tree.focused();
-            match search::find_initial(&level.entries, initial, level.cursor, forward) {
-                Some(i) => self.tree.set_cursor(i),
-                None => {
-                    self.message = Some(format!("no name starts with {initial}"));
-                    return;
-                }
-            }
-        }
     }
 
     fn run_ex(&mut self, line: &str) -> Response {
