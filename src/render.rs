@@ -212,7 +212,7 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App) {
             ("-- VISUAL --   d trash   y yank   x cut   Esc leaves", FG)
         }
         (None, None, None) => (
-            "j/k move  l enter  h back  / search  : command  d y x p  u undo  ? help  q quit",
+            "j/k move  l open or edit  h back  i external editor  / search  d y x p  u undo  ? help  q quit",
             DIM,
         ),
     };
@@ -1165,7 +1165,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("code.rs"), content).unwrap();
         let mut app = open(tmp.path());
-        keys(&mut app, "i");
+        keys(&mut app, "l");
         (tmp, app)
     }
 

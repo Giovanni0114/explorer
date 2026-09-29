@@ -466,9 +466,9 @@ impl App {
             Command::Enter => {
                 for _ in 0..n.min(MAX_REPEAT) {
                     let before = self.tree.focus();
-                    if let Some(effect) = self.tree.enter() {
+                    if let Some(Effect::Open(path)) = self.tree.enter() {
                         return Response {
-                            effect: Some(effect),
+                            effect: self.edit_here(path),
                             exit: None,
                         };
                     }
@@ -481,7 +481,19 @@ impl App {
             Command::Search => self.open_prompt(PromptKind::Search),
             Command::ExPrompt => self.open_prompt(PromptKind::Ex),
             Command::Help => self.open_help(),
-            Command::Edit => self.start_editing(),
+            Command::OpenExternal => {
+                let level = self.tree.focused();
+                match level.selected() {
+                    Some(entry) if entry.is_openable() => {
+                        return Response {
+                            effect: Some(Effect::Open(level.dir.join(&entry.name))),
+                            exit: None,
+                        };
+                    }
+                    Some(_) => self.message = Some("i opens files, l opens a folder".into()),
+                    None => self.message = Some("nothing to open".into()),
+                }
+            }
             Command::Trash | Command::Yank | Command::Cut => {
                 let operator = command.operator().expect("these are operators");
                 let targets = match self.visual_range() {
@@ -836,17 +848,9 @@ impl App {
         });
     }
 
-    fn start_editing(&mut self) {
-        let level = self.tree.focused();
-        let Some(entry) = level.selected() else {
-            self.message = Some("nothing to edit".into());
-            return;
-        };
-        if !entry.is_openable() {
-            self.message = Some("only files can be edited, l opens a folder".into());
-            return;
-        }
-        let path = level.dir.join(&entry.name);
+    /// Opens a file in the built-in editor. A file it cannot take, such as a binary or a huge one,
+    /// goes to the external opener instead.
+    fn edit_here(&mut self, path: PathBuf) -> Option<Effect> {
         let loaded = save::fingerprint(&path).and_then(|key| {
             if key.0 > crate::textbuf::MAX_BYTES as u64 {
                 return Ok(Err(crate::textbuf::LoadError::TooLarge(key.0 as usize)));
@@ -858,13 +862,13 @@ impl App {
                 editor.set_rows(usize::from(self.viewport));
                 editor.refresh_highlight();
                 self.mode = Mode::Edit(Box::new(editor));
+                None
             }
-            Ok(Err(reason)) => {
-                self.message = Some(format!(
-                    "cannot edit here: {reason}. Enter opens it in your editor"
-                ));
+            Ok(Err(_)) => Some(Effect::Open(path)),
+            Err(e) => {
+                self.message = Some(format!("{}: {e}", path.display()));
+                None
             }
-            Err(e) => self.message = Some(format!("{}: {e}", path.display())),
         }
     }
 
@@ -1345,14 +1349,29 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_file_returns_the_open_effect() {
+    fn i_hands_a_file_to_the_external_editor_and_l_edits_it_here() {
         let tmp = fixture();
         let mut app = open(tmp.path());
         keys(&mut app, "3j");
-        let response = keys(&mut app, "l");
+        let response = keys(&mut app, "i");
         assert_eq!(
             response.effect,
             Some(Effect::Open(tmp.path().join("Cargo.toml")))
+        );
+        assert!(app.editor().is_none());
+        let response = keys(&mut app, "l");
+        assert_eq!(response.effect, None);
+        assert!(app.editor().is_some());
+    }
+
+    #[test]
+    fn i_on_a_folder_says_what_it_does() {
+        let tmp = fixture();
+        let mut app = open(tmp.path());
+        assert_eq!(keys(&mut app, "i").effect, None);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("i opens files, l opens a folder")
         );
     }
 
@@ -2311,7 +2330,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("notes.txt"), content).unwrap();
         let mut app = open(root.path());
-        keys(&mut app, "i");
+        keys(&mut app, "l");
         (root, app)
     }
 
@@ -2364,7 +2383,7 @@ mod tests {
         keys(&mut app, "ob<esc>:wq<cr>");
         assert_eq!(on_disk(&root), "a\nb\n");
         assert!(app.editor().is_none());
-        keys(&mut app, "iddZZ");
+        keys(&mut app, "lddZZ");
         assert_eq!(on_disk(&root), "b\n");
         assert!(app.editor().is_none());
     }
@@ -2448,9 +2467,8 @@ mod tests {
     }
 
     #[test]
-    fn directories_binaries_and_huge_files_are_refused_with_a_reason() {
+    fn binaries_and_huge_files_go_to_the_external_opener_instead() {
         let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("adir")).unwrap();
         fs::write(root.path().join("bin"), b"\x7fELF\0\0").unwrap();
         fs::write(
             root.path().join("big"),
@@ -2458,30 +2476,11 @@ mod tests {
         )
         .unwrap();
         let mut app = open(root.path());
-        keys(&mut app, "i");
+        let response = keys(&mut app, "l");
+        assert_eq!(response.effect, Some(Effect::Open(root.path().join("big"))));
         assert!(app.editor().is_none());
-        assert_eq!(
-            app.message.as_deref(),
-            Some("only files can be edited, l opens a folder")
-        );
-        keys(&mut app, "ji");
-        assert!(
-            app.message
-                .as_deref()
-                .unwrap()
-                .contains("more than the 2 MB"),
-            "{:?}",
-            app.message
-        );
-        keys(&mut app, "ji");
-        assert!(
-            app.message
-                .as_deref()
-                .unwrap()
-                .contains("not a UTF-8 text file"),
-            "{:?}",
-            app.message
-        );
+        let response = keys(&mut app, "jl");
+        assert_eq!(response.effect, Some(Effect::Open(root.path().join("bin"))));
         assert!(app.editor().is_none());
     }
 

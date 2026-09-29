@@ -178,7 +178,7 @@ fn new_files_appear_without_a_keypress() {
 }
 
 #[test]
-fn enter_on_a_text_file_runs_the_configured_editor_and_returns() {
+fn i_on_a_text_file_runs_the_configured_editor_and_returns() {
     let tmp = fixture();
     let bin = tempfile::tempdir().unwrap();
     let log = bin.path().join("log");
@@ -208,7 +208,7 @@ fn enter_on_a_text_file_runs_the_configured_editor_and_returns() {
     s.wait_for_text("apps/");
     s.send("G");
     s.wait("on README", |r| center(r).contains("README.md"));
-    s.send(ENTER);
+    s.send("i");
     s.wait_for_text("IN-EDITOR>");
     s.send("hello\r");
     s.wait("tui is back", |r| {
@@ -457,7 +457,7 @@ fn i_edits_a_file_in_place_and_colon_wq_saves_it() {
     s.wait_for_text("apps/");
     s.send("G");
     s.wait("on README", |r| center(r).contains("README.md"));
-    s.send("i");
+    s.send("l");
     let rows = s.wait_for_text(":w save");
     assert!(rows[0].contains("README.md"), "{:?}", rows[0]);
     s.send("A more words");
@@ -484,7 +484,7 @@ fn the_editor_refuses_to_quit_with_unsaved_changes_and_undo_works() {
     let tmp = fixture();
     let mut s = Session::spawn(tmp.path());
     s.wait_for_text("apps/");
-    s.send("Gi");
+    s.send("Gl");
     s.wait_for_text(":w save");
     s.send("dd");
     s.wait("line deleted", |r| {
@@ -509,7 +509,7 @@ fn a_file_changed_by_another_program_is_not_overwritten() {
     let tmp = fixture();
     let mut s = Session::spawn(tmp.path());
     s.wait_for_text("apps/");
-    s.send("Gi");
+    s.send("Gl");
     s.wait_for_text(":w save");
     s.send("x");
     s.wait("dirty marker", |r| r[0].contains("[+]"));
