@@ -155,19 +155,47 @@ pub struct Drawn {
     pub area: Rect,
 }
 
-type Key = (PathBuf, usize, Size);
+pub type Key = (PathBuf, usize, Size);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BlockCell {
+pub struct BlockCell {
     ch: char,
     fg: (u8, u8, u8),
     bg: (u8, u8, u8),
 }
 
-enum Encoded {
+pub enum Encoded {
     Graphics(Protocol),
     Blocks { cells: Vec<BlockCell>, size: Size },
 }
+
+/// Encoding a picture for the terminal, to be done off the main thread.
+pub struct EncodeJob {
+    key: Key,
+    image: ImageData,
+    size: Size,
+    method: Method,
+    picker: Option<Picker>,
+}
+
+impl EncodeJob {
+    pub fn run(self) -> (Key, Option<Encoded>) {
+        let encoded = encode(self.method, self.picker.as_ref(), &self.image, self.size);
+        (self.key, encoded)
+    }
+
+    pub fn key(&self) -> Key {
+        self.key.clone()
+    }
+
+    /// Gives the job up, so the picture can be asked for again later.
+    pub fn abandon(self) -> (Key, Option<Encoded>) {
+        (self.key, None)
+    }
+}
+
+/// Encoded pictures kept, so going back to one is instant.
+const ENCODED_CACHE: usize = 12;
 
 impl Encoded {
     fn size(&self) -> Size {
@@ -183,7 +211,9 @@ pub struct Painter {
     picker: Option<Picker>,
     font: FontSize,
     reason: String,
-    cache: RefCell<Option<(Key, Encoded)>>,
+    cache: RefCell<std::collections::VecDeque<(Key, Arc<Encoded>)>>,
+    requested: RefCell<std::collections::HashSet<Key>>,
+    jobs: RefCell<Vec<EncodeJob>>,
     drawn: RefCell<Option<Drawn>>,
 }
 
@@ -236,7 +266,9 @@ impl Painter {
             picker,
             font,
             reason,
-            cache: RefCell::new(None),
+            cache: RefCell::default(),
+            requested: RefCell::default(),
+            jobs: RefCell::default(),
             drawn: RefCell::new(None),
         }
     }
@@ -274,17 +306,29 @@ impl Painter {
         Some(Size::new(cols, rows))
     }
 
-    /// Draws the image at the top left of `area`, encoding it again only when its size changed.
+    /// Draws the image at the top left of `area`. A picture not encoded for this size yet is queued
+    /// for the encoder thread and appears once it is ready.
     pub fn draw(&self, path: &std::path::Path, image: &ImageData, area: Rect, buf: &mut Buffer) {
         let Some(size) = self.fitted_size(image, area.as_size()) else {
             return;
         };
         let key: Key = (path.to_path_buf(), Arc::as_ptr(&image.0) as usize, size);
-        let mut cache = self.cache.borrow_mut();
-        if cache.as_ref().is_none_or(|(k, _)| *k != key) {
-            *cache = self.encode(image, size).map(|encoded| (key, encoded));
-        }
-        let Some((_, encoded)) = cache.as_ref() else {
+        let found = self
+            .cache
+            .borrow()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, e)| Arc::clone(e));
+        let Some(encoded) = found else {
+            if self.requested.borrow_mut().insert(key.clone()) {
+                self.jobs.borrow_mut().push(EncodeJob {
+                    key,
+                    image: image.clone(),
+                    size,
+                    method: self.method,
+                    picker: self.picker.clone(),
+                });
+            }
             return;
         };
         let placed = Rect {
@@ -292,7 +336,7 @@ impl Painter {
             height: encoded.size().height.min(area.height),
             ..area
         };
-        match encoded {
+        match &*encoded {
             Encoded::Graphics(protocol) => Image::new(protocol).render(placed, buf),
             Encoded::Blocks { cells, size } => {
                 for (i, cell) in cells.iter().enumerate() {
@@ -312,27 +356,67 @@ impl Painter {
         });
     }
 
-    fn encode(&self, image: &ImageData, size: Size) -> Option<Encoded> {
+    pub fn take_jobs(&self) -> Vec<EncodeJob> {
+        std::mem::take(&mut self.jobs.borrow_mut())
+    }
+
+    /// Keeps a finished encoding. `None` means the job was given up and may be asked for again.
+    pub fn store(&self, key: Key, encoded: Option<Encoded>) {
+        self.requested.borrow_mut().remove(&key);
+        let Some(encoded) = encoded else { return };
+        let mut cache = self.cache.borrow_mut();
+        cache.retain(|(k, _)| *k != key);
+        cache.push_back((key, Arc::new(encoded)));
+        while cache.len() > ENCODED_CACHE {
+            cache.pop_front();
+        }
+    }
+
+    /// Runs the queued encodings on this thread. For tests and benchmarks.
+    pub fn run_jobs_now(&self) {
+        for job in self.take_jobs() {
+            let (key, encoded) = job.run();
+            self.store(key, encoded);
+        }
+    }
+
+    /// The largest picture worth decoding for a terminal of this many cells.
+    pub fn decode_target(&self, columns: u16, rows: u16) -> (u32, u32) {
         match self.method {
-            Method::Off => None,
-            Method::Graphics(_) => {
-                let picker = self.picker.as_ref()?;
-                let smooth = Resize::Scale(Some(FilterType::CatmullRom));
-                picker
-                    .new_protocol((*image.0).clone(), size, smooth)
-                    .ok()
-                    .map(Encoded::Graphics)
-            }
-            Method::Blocks(kind) => Some(Encoded::Blocks {
-                cells: encode_blocks(&image.0, size, kind),
-                size,
-            }),
+            Method::Graphics(_) => (
+                u32::from(columns) * u32::from(self.font.width),
+                u32::from(rows) * u32::from(self.font.height),
+            ),
+            // Two pixels a cell each way, and twice that so the smoothing filter has something to average.
+            Method::Blocks(_) | Method::Off => (u32::from(columns) * 4, u32::from(rows) * 4),
         }
     }
 
     /// What the last frame showed, cleared for the next one.
     pub fn take_drawn(&self) -> Option<Drawn> {
         self.drawn.borrow_mut().take()
+    }
+}
+
+fn encode(
+    method: Method,
+    picker: Option<&Picker>,
+    image: &ImageData,
+    size: Size,
+) -> Option<Encoded> {
+    match method {
+        Method::Off => None,
+        Method::Graphics(_) => {
+            let smooth = Resize::Scale(Some(FilterType::CatmullRom));
+            picker?
+                .new_protocol((*image.0).clone(), size, smooth)
+                .ok()
+                .map(Encoded::Graphics)
+        }
+        Method::Blocks(kind) => Some(Encoded::Blocks {
+            cells: encode_blocks(&image.0, size, kind),
+            size,
+        }),
     }
 }
 
@@ -493,7 +577,16 @@ mod tests {
             Rect::new(2, 1, 20, 10),
             &mut buf,
         );
-        let drawn = painter.take_drawn().expect("something was drawn");
+        painter.run_jobs_now();
+        painter.draw(
+            std::path::Path::new("/p.png"),
+            &image,
+            Rect::new(2, 1, 20, 10),
+            &mut buf,
+        );
+        let drawn = painter
+            .take_drawn()
+            .expect("something was drawn once encoded");
         assert_eq!((drawn.area.x, drawn.area.y), (2, 1));
         assert!(drawn.area.width <= 20 && drawn.area.height <= 10);
         let left = &buf[(drawn.area.x, drawn.area.y)];
@@ -515,6 +608,13 @@ mod tests {
         let image = ImageData(Arc::new(DynamicImage::ImageRgb8(board)));
         let painter = Painter::halfblocks();
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 10));
+        painter.draw(
+            std::path::Path::new("/board.png"),
+            &image,
+            buf.area,
+            &mut buf,
+        );
+        painter.run_jobs_now();
         painter.draw(
             std::path::Path::new("/board.png"),
             &image,

@@ -9,7 +9,10 @@ use std::{
     time::SystemTime,
 };
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use chrono::{DateTime, Local};
+use image::ImageDecoder;
 use syntect::{
     easy::HighlightLines,
     highlighting::{Theme, ThemeSet},
@@ -78,6 +81,18 @@ pub struct Content {
 }
 
 impl Content {
+    /// Roughly how much memory this preview holds.
+    pub fn weight(&self) -> usize {
+        let picture = self.image.as_ref().map_or(0, |i| i.0.as_bytes().len());
+        let text: usize = self
+            .lines
+            .iter()
+            .flat_map(|l| &l.0)
+            .map(|s| s.text.len() + 16)
+            .sum();
+        picture + text
+    }
+
     fn message(text: &str) -> Content {
         Content {
             image: None,
@@ -232,25 +247,89 @@ pub(crate) fn highlight(source: &[String], path: &Path) -> Vec<Line> {
 }
 
 pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
-/// Pictures are shrunk to this many pixels on their longer side, which is sharper than any terminal cell grid.
+/// Pictures are never kept larger than this on either side.
 const MAX_IMAGE_SIDE: u32 = 2048;
 
+static TARGET_WIDTH: AtomicU32 = AtomicU32::new(MAX_IMAGE_SIDE);
+static TARGET_HEIGHT: AtomicU32 = AtomicU32::new(MAX_IMAGE_SIDE);
+
+/// The most pixels a picture is ever shown with, from the terminal size and drawing method.
+/// Pictures are decoded and shrunk to fit this, so a 40 megapixel photo costs no more than the screen.
+pub fn set_image_target(width: u32, height: u32) {
+    TARGET_WIDTH.store(width.clamp(64, MAX_IMAGE_SIDE), Ordering::Relaxed);
+    TARGET_HEIGHT.store(height.clamp(64, MAX_IMAGE_SIDE), Ordering::Relaxed);
+}
+
+fn image_target() -> (u32, u32) {
+    (
+        TARGET_WIDTH.load(Ordering::Relaxed),
+        TARGET_HEIGHT.load(Ordering::Relaxed),
+    )
+}
+
 fn decode_image(path: &Path) -> Result<ImageData, String> {
-    let mut reader = image::ImageReader::open(path)
+    let (width, height) = image_target();
+    let reader = image::ImageReader::open(path)
         .and_then(|r| r.with_guessed_format())
         .map_err(|e| e.to_string())?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(20_000);
-    limits.max_image_height = Some(20_000);
-    limits.max_alloc = Some(512 * 1024 * 1024);
-    reader.limits(limits);
-    let image = reader.decode().map_err(|e| e.to_string())?;
-    let image = if image.width() > MAX_IMAGE_SIDE || image.height() > MAX_IMAGE_SIDE {
-        image.thumbnail(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE)
+    let is_jpeg = reader.format() == Some(image::ImageFormat::Jpeg);
+    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let scaled = if is_jpeg {
+        decode_jpeg_scaled(path, width, height).ok()
+    } else {
+        None
+    };
+    let image = match scaled {
+        Some(image) => image,
+        None => {
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(20_000);
+            limits.max_image_height = Some(20_000);
+            limits.max_alloc = Some(512 * 1024 * 1024);
+            decoder.set_limits(limits).map_err(|e| e.to_string())?;
+            image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?
+        }
+    };
+    let mut image = if image.width() > width || image.height() > height {
+        image.thumbnail(width, height)
     } else {
         image
     };
+    image.apply_orientation(orientation);
     Ok(ImageData(std::sync::Arc::new(image)))
+}
+
+/// Decodes a JPEG straight at a reduced scale (1/2, 1/4 or 1/8), which skips most of the work
+/// for big photos. `None`-worthy formats such as CMYK are left to the general decoder.
+fn decode_jpeg_scaled(path: &Path, width: u32, height: u32) -> Result<image::DynamicImage, String> {
+    use jpeg_decoder::PixelFormat;
+    let file = std::io::BufReader::new(File::open(path).map_err(|e| e.to_string())?);
+    let mut decoder = jpeg_decoder::Decoder::new(file);
+    decoder.set_max_decoding_buffer_size(512 * 1024 * 1024);
+    let clamp = |v: u32| v.min(u32::from(u16::MAX)) as u16;
+    let (w, h) = decoder
+        .scale(clamp(width), clamp(height))
+        .map_err(|e| e.to_string())?;
+    let pixels = decoder.decode().map_err(|e| e.to_string())?;
+    let format = decoder.info().ok_or("no image information")?.pixel_format;
+    let (w, h) = (u32::from(w), u32::from(h));
+    let image = match format {
+        PixelFormat::RGB24 => {
+            image::RgbImage::from_raw(w, h, pixels).map(image::DynamicImage::ImageRgb8)
+        }
+        PixelFormat::L8 => {
+            image::GrayImage::from_raw(w, h, pixels).map(image::DynamicImage::ImageLuma8)
+        }
+        PixelFormat::L16 => {
+            let high: Vec<u8> = pixels.as_chunks::<2>().0.iter().map(|c| c[0]).collect();
+            image::GrayImage::from_raw(w, h, high).map(image::DynamicImage::ImageLuma8)
+        }
+        PixelFormat::CMYK32 => None,
+    };
+    image.ok_or_else(|| "unsupported pixel layout".to_string())
 }
 
 fn image_content(head: &[u8], meta: &fs::Metadata, image: ImageData) -> Content {

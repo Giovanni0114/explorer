@@ -53,6 +53,7 @@ enum Msg {
     Previewed(PreviewRequest, io::Result<Content>),
     JobProgress(u64, u64, u64),
     JobDone(u64, Outcome),
+    Encoded(crate::imageview::Key, Option<crate::imageview::Encoded>),
     /// SIGTERM or SIGHUP: leave at once, putting the terminal back.
     Terminate,
     FsChange(Vec<PathBuf>),
@@ -63,7 +64,9 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
     let gate = Arc::new(InputGate::default());
     spawn_input(tx.clone(), Arc::clone(&gate));
     let loader = spawn_loaders(tx.clone());
-    let previewer = spawn_previewers(tx.clone());
+    let encoder = spawn_encoder(tx.clone());
+    let wanted: Wanted = Arc::default();
+    let previewer = spawn_previewers(tx.clone(), Arc::clone(&wanted));
     let worker = spawn_job_worker(tx.clone(), app.trasher());
     spawn_signal_listener(tx.clone());
     let mut last_image: Option<crate::imageview::Drawn> = None;
@@ -84,7 +87,11 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
         for job in app.take_jobs() {
             let _ = worker.send(job);
         }
-        for request in app.tree_mut().take_preview_requests() {
+        let requests = app.tree_mut().take_preview_requests();
+        if let Some(last) = requests.last() {
+            *wanted.lock().unwrap() = Some(last.path.clone());
+        }
+        for request in requests {
             let _ = previewer.send(request);
         }
         watcher.sync(app.tree().dirs());
@@ -98,6 +105,9 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
             app.painter().take_drawn();
         }
         last_image = drawn;
+        for job in app.painter().take_jobs() {
+            let _ = encoder.send(job);
+        }
 
         let wait = [
             flush_at.map(|t| t.saturating_duration_since(Instant::now())),
@@ -124,6 +134,7 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
         for msg in first.into_iter().chain(rx.try_iter().collect::<Vec<_>>()) {
             match msg {
                 Msg::Terminate => return Ok(Exit::Abort),
+                Msg::Encoded(key, encoded) => app.painter().store(key, encoded),
                 Msg::Input(Event::Key(key))
                     if key.kind == KeyEventKind::Press
                         && key.code == KeyCode::Char('z')
@@ -354,18 +365,53 @@ fn spawn_job_worker(msgs: Sender<Msg>, trash: Arc<dyn ops::Trasher>) -> Sender<J
     tx
 }
 
-fn spawn_previewers(msgs: Sender<Msg>) -> Sender<PreviewRequest> {
+/// Encodes pictures for the terminal one at a time. Only the newest job matters, since only one
+/// picture is on screen, so older ones waiting in line are handed back undone.
+fn spawn_encoder(msgs: Sender<Msg>) -> Sender<crate::imageview::EncodeJob> {
+    let (tx, rx) = mpsc::channel::<crate::imageview::EncodeJob>();
+    thread::spawn(move || {
+        while let Ok(mut job) = rx.recv() {
+            while let Ok(newer) = rx.try_recv() {
+                let (key, _) = job.abandon();
+                if msgs.send(Msg::Encoded(key, None)).is_err() {
+                    return;
+                }
+                job = newer;
+            }
+            let key = job.key();
+            let (key, encoded) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
+                    .unwrap_or((key, None));
+            if msgs.send(Msg::Encoded(key, encoded)).is_err() {
+                return;
+            }
+        }
+    });
+    tx
+}
+
+/// The file whose preview is wanted now. Workers skip requests for files the cursor has left, so
+/// scrolling through a folder of big photos never builds a queue.
+type Wanted = Arc<Mutex<Option<PathBuf>>>;
+
+fn spawn_previewers(msgs: Sender<Msg>, wanted: Wanted) -> Sender<PreviewRequest> {
     let (tx, rx) = mpsc::channel::<PreviewRequest>();
     let rx: Arc<Mutex<Receiver<PreviewRequest>>> = Arc::new(Mutex::new(rx));
     for _ in 0..PREVIEW_WORKERS {
-        let (rx, msgs) = (Arc::clone(&rx), msgs.clone());
+        let (rx, msgs, wanted) = (Arc::clone(&rx), msgs.clone(), Arc::clone(&wanted));
         thread::spawn(move || {
             loop {
                 let request = match rx.lock().unwrap().recv() {
                     Ok(request) => request,
                     Err(_) => return,
                 };
-                let result = preview::build(&request.path);
+                let result = if wanted.lock().unwrap().as_ref() != Some(&request.path) {
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "skipped"))
+                } else {
+                    // A decoder that panics on a malformed file must not take the worker down with it.
+                    std::panic::catch_unwind(|| preview::build(&request.path))
+                        .unwrap_or_else(|_| Err(io::Error::other("the file could not be read")))
+                };
                 if msgs.send(Msg::Previewed(request, result)).is_err() {
                     return;
                 }

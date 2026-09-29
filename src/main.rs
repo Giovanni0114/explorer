@@ -63,6 +63,9 @@ fn main() -> io::Result<()> {
         None
     };
     let painter = Painter::new(images, answers.as_ref());
+    let screen = terminal.size()?;
+    let (width, height) = painter.decode_target(screen.width, screen.height);
+    tx::preview::set_image_target(width, height);
     let settings = Settings {
         show_hidden: config.show_hidden,
         tree_width: config.tree_width,

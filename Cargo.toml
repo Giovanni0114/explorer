@@ -10,6 +10,7 @@ flate2 = "1.1.10"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
 imagesize = "0.15.0"
 infer = "0.22.0"
+jpeg-decoder = "0.3.2"
 notify = "8.2.0"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
@@ -36,5 +37,4 @@ inherits = "release"
 opt-level = "s"
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = true

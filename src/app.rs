@@ -485,6 +485,7 @@ impl App {
                 break;
             }
         }
+        self.painter.run_jobs_now();
         self.pull_notice();
     }
 

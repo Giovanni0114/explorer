@@ -124,11 +124,14 @@ pub struct PreviewRequest {
 }
 
 const PREVIEW_CACHE_CAP: usize = 64;
+/// Previews kept in memory may use this much between them. Pictures dominate.
+const PREVIEW_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Default)]
 struct PreviewCache {
     entries: HashMap<(PathBuf, PreviewKey), Arc<Content>>,
     order: VecDeque<(PathBuf, PreviewKey)>,
+    bytes: usize,
 }
 
 impl PreviewCache {
@@ -137,12 +140,18 @@ impl PreviewCache {
     }
 
     fn insert(&mut self, path: PathBuf, key: PreviewKey, content: Arc<Content>) {
-        if self.entries.insert((path.clone(), key), content).is_none() {
-            self.order.push_back((path, key));
+        self.bytes += content.weight();
+        match self.entries.insert((path.clone(), key), content) {
+            Some(replaced) => self.bytes -= replaced.weight(),
+            None => self.order.push_back((path, key)),
         }
-        while self.order.len() > PREVIEW_CACHE_CAP {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
+        while self.order.len() > PREVIEW_CACHE_CAP
+            || (self.bytes > PREVIEW_CACHE_BYTES && self.order.len() > 1)
+        {
+            if let Some(oldest) = self.order.pop_front()
+                && let Some(gone) = self.entries.remove(&oldest)
+            {
+                self.bytes -= gone.weight();
             }
         }
     }
@@ -323,6 +332,13 @@ impl Tree {
     }
 
     pub fn finish_preview(&mut self, request: &PreviewRequest, result: io::Result<Content>) {
+        // A skipped request says nothing about the file. If it is wanted again, a new request is on its way.
+        if result
+            .as_ref()
+            .is_err_and(|e| e.kind() == io::ErrorKind::Interrupted)
+        {
+            return;
+        }
         let outcome = result.map(Arc::new).map_err(|e| e.to_string());
         if let Ok(content) = &outcome {
             self.preview_cache
@@ -993,5 +1009,50 @@ mod tests {
             tmp.path().join(".config/app/settings.toml")
         );
         assert_eq!(tree.take_notice(), None);
+    }
+
+    #[test]
+    fn a_skipped_preview_leaves_the_file_loading_instead_of_failed() {
+        let tmp = fixture();
+        let mut tree = open(tmp.path());
+        tree.move_by(2);
+        let request = tree.take_preview_requests().pop().unwrap();
+        tree.finish_preview(
+            &request,
+            Err(io::Error::new(io::ErrorKind::Interrupted, "skipped")),
+        );
+        assert!(matches!(
+            tree.preview().unwrap().state,
+            PreviewState::Loading { .. }
+        ));
+    }
+
+    #[test]
+    fn big_pictures_are_evicted_by_the_bytes_they_take() {
+        let mut cache = PreviewCache::default();
+        let picture = |side: u32| {
+            Arc::new(Content {
+                image: Some(crate::imageview::ImageData(Arc::new(
+                    image::DynamicImage::new_rgba8(side, side),
+                ))),
+                lines: Vec::new(),
+                numbered: false,
+            })
+        };
+        // 4096x4096 RGBA is 64 MiB, so five of them pass the 256 MiB budget.
+        for i in 0..5 {
+            cache.insert(PathBuf::from(format!("/p{i}")), (0, None), picture(4096));
+        }
+        assert!(
+            cache.get(Path::new("/p0"), (0, None)).is_none(),
+            "the oldest went"
+        );
+        assert!(cache.get(Path::new("/p4"), (0, None)).is_some());
+        assert!(cache.bytes <= PREVIEW_CACHE_BYTES);
+        cache.insert(PathBuf::from("/p4"), (0, None), picture(16));
+        assert!(
+            cache.bytes < 200 * 1024 * 1024,
+            "replacing an entry releases its bytes"
+        );
     }
 }

@@ -808,6 +808,11 @@ mod tests {
         terminal
             .draw(|f| render(app, f.area(), f.buffer_mut()))
             .unwrap();
+        // Pictures are encoded after the first frame asks for them, as the runtime's encoder thread would.
+        app.painter().run_jobs_now();
+        terminal
+            .draw(|f| render(app, f.area(), f.buffer_mut()))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let lines = (0..h)
             .map(|y| {
