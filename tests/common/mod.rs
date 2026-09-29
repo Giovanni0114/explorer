@@ -69,6 +69,11 @@ impl Session {
         cmd.env("HOME", home.path());
         cmd.env("XDG_CONFIG_HOME", &config_dir);
         cmd.env("XDG_STATE_HOME", home.path().join("state"));
+        // The machine running the tests may itself be reached over SSH, which changes how long the
+        // program waits for the terminal. Tests that want SSH say so in `env`.
+        for name in ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"] {
+            cmd.env_remove(name);
+        }
         for (k, v) in &opts.env {
             cmd.env(k, v);
         }

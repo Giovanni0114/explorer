@@ -690,3 +690,31 @@ fn a_terminal_that_never_answers_costs_only_the_timeout_and_no_keys() {
         rows.last()
     );
 }
+
+#[test]
+fn over_ssh_a_silent_terminal_is_waited_for_longer_and_keys_still_work() {
+    let tmp = fixture();
+    let started = std::time::Instant::now();
+    let mut s = Session::spawn_with(
+        tmp.path(),
+        Opts {
+            config: Some("images = \"auto\"\n"),
+            env: vec![
+                ("TERM", "xterm-256color".to_string()),
+                ("SSH_CONNECTION", "10.0.0.2 50000 10.0.0.1 22".to_string()),
+            ],
+            ..Opts::default()
+        },
+    );
+    s.wait_for_text("apps/");
+    let waited = started.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(1900),
+        "{waited:?}"
+    );
+    assert!(waited < std::time::Duration::from_secs(4), "{waited:?}");
+    s.send("j");
+    s.wait("the first key after start works", |r| {
+        center(r).contains("notes/")
+    });
+}
