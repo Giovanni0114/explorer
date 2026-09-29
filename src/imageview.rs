@@ -376,7 +376,7 @@ fn best_quadrant(pixels: [Rgb; 4]) -> BlockCell {
     };
     let mut best_error = error(&pixels, best.bg);
     // A mask and its complement split the pixels the same way, so the masks up to 7 cover every split.
-    for mask in 1..8usize {
+    for (mask, &ch) in QUADRANTS.iter().enumerate().take(8).skip(1) {
         let (fg, bg): (Vec<Rgb>, Vec<Rgb>) = (0..4).map(|i| (mask >> i & 1 == 1, pixels[i])).fold(
             (Vec::new(), Vec::new()),
             |(mut f, mut b), (on, p)| {
@@ -393,7 +393,7 @@ fn best_quadrant(pixels: [Rgb; 4]) -> BlockCell {
         if total < best_error {
             best_error = total;
             best = BlockCell {
-                ch: QUADRANTS[mask],
+                ch,
                 fg: fg_color,
                 bg: bg_color,
             };
