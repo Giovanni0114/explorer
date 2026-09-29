@@ -1,0 +1,289 @@
+mod common;
+
+use common::*;
+
+fn center(rows: &[String]) -> &str {
+    &rows[Session::CENTER]
+}
+
+#[test]
+fn starts_on_the_first_entry_flush_left_with_the_preview_and_brace() {
+    let tmp = fixture();
+    let s = Session::spawn(tmp.path());
+    let rows = s.wait_for_text("apps/");
+    assert!(center(&rows).starts_with(" apps/"), "{:?}", center(&rows));
+    assert!(center(&rows).contains("─┬─"), "{:?}", center(&rows));
+    assert!(rows.iter().any(|r| r.contains("web/")), "{rows:#?}");
+}
+
+#[test]
+fn vim_counts_and_jumps_move_the_cursor_row() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("2j");
+    let rows = s.wait("cursor on zeta", |r| center(r).contains("zeta/"));
+    assert!(center(&rows).starts_with(" zeta/"));
+    s.send("gg");
+    s.wait("cursor back on apps", |r| center(r).contains("apps/"));
+    s.send("G");
+    s.wait("cursor on README", |r| center(r).contains("README.md"));
+    s.send("fn");
+    s.wait("f jumps by letter", |r| center(r).contains("notes/"));
+}
+
+#[test]
+fn slash_search_previews_as_you_type_and_escape_restores() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("/zet");
+    let rows = s.wait("incremental jump", |r| center(r).contains("zeta/"));
+    assert!(
+        rows[rows.len() - 1].trim() == "/zet",
+        "{:?}",
+        rows[rows.len() - 1]
+    );
+    s.send(ESC);
+    s.wait("restored", |r| {
+        center(r).contains("apps/") && !r[r.len() - 1].contains("/zet")
+    });
+}
+
+#[test]
+fn question_mark_opens_the_key_reference_and_q_closes_it() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("?");
+    let rows = s.wait_for_text("move down");
+    assert!(rows.iter().any(|r| r.contains("gg")), "{rows:#?}");
+    s.send("q");
+    s.wait("overlay gone", |r| {
+        !r.iter().any(|x| x.contains("move down"))
+    });
+}
+
+#[test]
+fn levels_have_distinct_colors_and_the_cursor_row_is_filled() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("l");
+    let rows = s.wait("focus moved into apps", |r| {
+        r.iter().any(|x| x.contains("api/"))
+    });
+    let row = Session::CENTER as u16;
+    let text = center(&rows).to_string();
+    let first = text.find("apps/").unwrap() as u16;
+    let second = text.find("api/").unwrap() as u16;
+    assert_ne!(
+        s.fg(row, first),
+        s.fg(row, second),
+        "each level has its own color"
+    );
+    assert_ne!(
+        s.bg(row, second),
+        vt100::Color::Default,
+        "cursor row is filled"
+    );
+}
+
+#[test]
+fn quit_writes_the_directory_and_ctrl_c_does_not() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("ljl");
+    s.wait("focus two levels deep", |r| {
+        r.iter().any(|x| x.contains("index.html"))
+    });
+    s.send("q");
+    assert_eq!(s.wait_exit(), 0);
+    let written = std::fs::read_to_string(&s.cwd_file).unwrap();
+    assert_eq!(
+        written,
+        tmp.path()
+            .join("apps/web")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("l");
+    s.wait_for_text("api/");
+    s.send(CTRL_C);
+    assert_eq!(s.wait_exit(), 0);
+    assert!(!s.cwd_file.exists(), "ctrl-c must not move the shell");
+}
+
+#[test]
+fn colon_commands_run_from_the_command_line() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send(":cd notes\r");
+    s.wait("empty dir", |r| {
+        r.iter().any(|x| x.contains("(empty)")) || r.iter().all(|x| !x.contains("apps/"))
+    });
+    s.send(":q\r");
+    assert_eq!(s.wait_exit(), 0);
+    assert!(
+        std::fs::read_to_string(&s.cwd_file)
+            .unwrap()
+            .ends_with("notes")
+    );
+}
+
+#[test]
+fn config_can_rebind_keys_and_bad_config_is_reported() {
+    let tmp = fixture();
+    let mut s = Session::spawn_with(
+        tmp.path(),
+        Opts {
+            config: Some("[keys]\n\"<space>\" = \"down\"\n"),
+            ..Opts::default()
+        },
+    );
+    s.wait_for_text("apps/");
+    s.send(" ");
+    s.wait("space moved down", |r| center(r).contains("notes/"));
+
+    let s = Session::spawn_with(
+        tmp.path(),
+        Opts {
+            config: Some("[keys]\nx = \"explode\"\n"),
+            ..Opts::default()
+        },
+    );
+    let rows = s.wait_for_text("unknown command");
+    assert!(rows.last().unwrap().contains("config:"), "{rows:#?}");
+}
+
+#[test]
+fn new_files_appear_without_a_keypress() {
+    let tmp = fixture();
+    let s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    std::fs::write(tmp.path().join("aaa-fresh.txt"), "x").unwrap();
+    s.wait_for_text("aaa-fresh.txt");
+}
+
+#[test]
+fn enter_on_a_text_file_runs_the_configured_editor_and_returns() {
+    let tmp = fixture();
+    let bin = tempfile::tempdir().unwrap();
+    let log = bin.path().join("log");
+    let script = bin.path().join("ed.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$1\" > '{}'\nprintf 'IN-EDITOR> '\nread w\necho \"$w\" >> '{}'\n",
+            log.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::os::unix::fs::PermissionsExt::set_mode(
+        &mut std::fs::metadata(&script).unwrap().permissions(),
+        0o755,
+    );
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let config = format!("editor = \"{}\"\n", script.display());
+    let mut s = Session::spawn_with(
+        tmp.path(),
+        Opts {
+            config: Some(&config),
+            ..Opts::default()
+        },
+    );
+    s.wait_for_text("apps/");
+    s.send("G");
+    s.wait("on README", |r| center(r).contains("README.md"));
+    s.send(ENTER);
+    s.wait_for_text("IN-EDITOR>");
+    s.send("hello\r");
+    s.wait("tui is back", |r| {
+        r.iter().any(|x| x.contains("README.md")) && !r.iter().any(|x| x.contains("IN-EDITOR"))
+    });
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        logged.contains("README.md") && logged.contains("hello"),
+        "{logged}"
+    );
+    s.send("j");
+    s.send("q");
+    assert_eq!(s.wait_exit(), 0);
+}
+
+#[test]
+fn zh_shows_dotfiles_live() {
+    let tmp = fixture();
+    std::fs::write(tmp.path().join(".env"), "SECRET=1\n").unwrap();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    assert!(!s.screen().contains(".env"));
+    s.send("zh");
+    let rows = s.wait_for_text(".env");
+    assert!(rows[0].contains("dotfiles shown"), "{:?}", rows[0]);
+    s.send("zh");
+    s.wait("hidden again", |r| !r.iter().any(|x| x.contains(".env")));
+}
+
+#[test]
+fn bookmarks_survive_a_restart_and_jump_across_levels() {
+    let tmp = fixture();
+    let state = tempfile::tempdir().unwrap();
+    let env = || vec![("XDG_STATE_HOME", state.path().to_str().unwrap().to_string())];
+
+    let mut s = Session::spawn_with(
+        tmp.path(),
+        Opts {
+            env: env(),
+            ..Opts::default()
+        },
+    );
+    s.wait_for_text("apps/");
+    s.send("ljlmH");
+    s.wait_for_text("index.html");
+    s.send("q");
+    assert_eq!(s.wait_exit(), 0);
+    assert!(
+        std::fs::read_to_string(state.path().join("tx/marks"))
+            .unwrap()
+            .starts_with("H\t/")
+    );
+
+    let mut s = Session::spawn_with(
+        tmp.path(),
+        Opts {
+            env: env(),
+            ..Opts::default()
+        },
+    );
+    s.wait_for_text("apps/");
+    s.send("'H");
+    let rows = s.wait("jumped to the bookmark", |r| {
+        center(r).contains("index.html") || center(r).contains("src/")
+    });
+    assert!(rows.iter().any(|r| r.contains("index.html")), "{rows:#?}");
+    s.send("<");
+    s.send(":marks\r");
+    s.wait_for_text("H   ");
+}
+
+#[test]
+fn ctrl_o_returns_to_where_a_jump_started() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("G");
+    s.wait("on README", |r| center(r).contains("README.md"));
+    s.send("\x0f");
+    s.wait("back on apps", |r| center(r).contains("apps/"));
+    s.send("\t");
+    s.wait("forward on README", |r| center(r).contains("README.md"));
+}
