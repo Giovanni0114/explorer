@@ -506,7 +506,7 @@ impl FakeTrash {
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub fn item_count(&self) -> usize {
         fs::read_dir(&self.dir).unwrap().count()
     }
 }
@@ -785,7 +785,7 @@ mod tests {
         e.write("a.txt", "a");
         let trashed = e.run(&[Op::Trash { path: e.p("a.txt") }]);
         assert!(!e.p("a.txt").exists());
-        assert_eq!(e.trash.len(), 1);
+        assert_eq!(e.trash.item_count(), 1);
         let undo = trashed.done[0].undo.clone();
         e.write("a.txt", "someone made a new one");
         let blocked = e.run(std::slice::from_ref(&undo));

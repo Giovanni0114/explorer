@@ -2,6 +2,7 @@ pub mod actions;
 pub mod app;
 pub mod config;
 pub mod excmd;
+pub mod fileops;
 pub mod fsread;
 pub mod jumps;
 pub mod keys;
