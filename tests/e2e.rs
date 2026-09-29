@@ -529,3 +529,29 @@ fn a_file_changed_by_another_program_is_not_overwritten() {
         r.iter().any(|x| x.contains("changed by someone else"))
     });
 }
+
+#[test]
+fn visual_mode_in_the_editor_deletes_a_selection() {
+    let tmp = fixture();
+    std::fs::write(
+        tmp.path().join("README.md"),
+        "keep\ndrop one\ndrop two\nkeep too\n",
+    )
+    .unwrap();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("Gl");
+    s.wait_for_text(":w save");
+    s.send("jV");
+    s.wait_for_text("-- VISUAL LINE --");
+    s.send("jd");
+    s.wait("lines gone", |r| !r.iter().any(|x| x.contains("drop")));
+    s.send(":wq\r");
+    s.wait("back in the tree", |r| {
+        r.last().unwrap().contains("j/k move")
+    });
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+        "keep\nkeep too\n"
+    );
+}

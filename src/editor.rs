@@ -77,6 +77,11 @@ pub enum EditCommand {
     ExPrompt,
     WriteQuit,
     QuitDiscard,
+    Visual,
+    VisualLine,
+    SwapEnds,
+    Lowercase,
+    Uppercase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,11 +213,25 @@ const DEFAULT_KEYS: &[(&str, EditCommand)] = &[
     (":", EditCommand::ExPrompt),
     ("ZZ", EditCommand::WriteQuit),
     ("ZQ", EditCommand::QuitDiscard),
+    ("v", EditCommand::Visual),
+    ("V", EditCommand::VisualLine),
 ];
 
-fn edit_keymap() -> Keymap<EditCommand> {
-    let bindings = DEFAULT_KEYS
+/// Keys that mean something else while a selection is active, like vim's visual mode.
+const VISUAL_KEYS: &[(&str, EditCommand)] = &[
+    ("o", EditCommand::SwapEnds),
+    ("O", EditCommand::SwapEnds),
+    ("u", EditCommand::Lowercase),
+    ("U", EditCommand::Uppercase),
+    ("x", EditCommand::Delete),
+    ("<del>", EditCommand::Delete),
+    ("s", EditCommand::Change),
+];
+
+fn build_keymap(tables: &[&[(&str, EditCommand)]]) -> Keymap<EditCommand> {
+    let bindings = tables
         .iter()
+        .flat_map(|table| table.iter())
         .map(|(keys, command)| (Key::parse_seq(keys).expect("valid default key"), *command))
         .collect();
     Keymap::from_bindings(bindings).expect("default editor keys do not shadow each other")
@@ -266,6 +285,11 @@ enum Mode {
     Normal,
     Insert,
     Prompt(Prompt),
+    /// A selection from `anchor` to the cursor, by characters or by whole lines.
+    Visual {
+        anchor: Pos,
+        lines: bool,
+    },
 }
 
 pub struct Editor {
@@ -277,6 +301,7 @@ pub struct Editor {
     mode: Mode,
     input: InputState<EditCommand>,
     keymap: Keymap<EditCommand>,
+    visual_keymap: Keymap<EditCommand>,
     register: Option<Register>,
     last_find: Option<Find>,
     last_search: Option<String>,
@@ -304,7 +329,8 @@ impl Editor {
             want_col: 0,
             mode: Mode::Normal,
             input: InputState::default(),
-            keymap: edit_keymap(),
+            keymap: build_keymap(&[DEFAULT_KEYS]),
+            visual_keymap: build_keymap(&[DEFAULT_KEYS, VISUAL_KEYS]),
             register: None,
             last_find: None,
             last_search: None,
@@ -467,6 +493,10 @@ impl Editor {
                 None
             }
             Mode::Normal => self.press_normal(key),
+            Mode::Visual { .. } => {
+                self.press_visual(key);
+                None
+            }
         };
         self.settle_cursor();
         event
@@ -583,9 +613,172 @@ impl Editor {
                 });
             }
             QuitDiscard => return Some(EditEvent::Close),
+            Visual | VisualLine => {
+                self.mode = Mode::Visual {
+                    anchor: self.cursor,
+                    lines: command == VisualLine,
+                };
+            }
             _ => {}
         }
         None
+    }
+
+    /// The selection as its first and last position, inclusive, and whether it is whole lines.
+    pub fn selection(&self) -> Option<(Pos, Pos, bool)> {
+        let Mode::Visual { anchor, lines } = self.mode else {
+            return None;
+        };
+        let anchor = self.buf.clamp(anchor, false);
+        let (a, b) = if anchor <= self.cursor {
+            (anchor, self.cursor)
+        } else {
+            (self.cursor, anchor)
+        };
+        Some((a, b, lines))
+    }
+
+    /// `-- VISUAL --` or `-- VISUAL LINE --` while selecting.
+    pub fn visual_label(&self) -> Option<&'static str> {
+        match self.mode {
+            Mode::Visual { lines: true, .. } => Some("-- VISUAL LINE --"),
+            Mode::Visual { lines: false, .. } => Some("-- VISUAL --"),
+            _ => None,
+        }
+    }
+
+    fn selection_range(&self) -> Option<Range> {
+        let (a, b, lines) = self.selection()?;
+        Some(if lines {
+            Range {
+                start: Pos::new(a.line, 0),
+                end: Pos::new(b.line, self.buf.line_len(b.line)),
+                linewise: true,
+            }
+        } else {
+            Range {
+                start: a,
+                end: Pos::new(b.line, (b.col + 1).min(self.buf.line_len(b.line))),
+                linewise: false,
+            }
+        })
+    }
+
+    fn press_visual(&mut self, key: Key) {
+        let plain_escape = key.code == KeyCode::Esc && !key.ctrl && !key.alt;
+        let interrupt = key.code == KeyCode::Char('c') && key.ctrl;
+        if (plain_escape || interrupt) && !self.input.is_pending() {
+            self.mode = Mode::Normal;
+            return;
+        }
+        if let Fed::Run {
+            command,
+            count,
+            arg,
+        } = self.input.feed(key, &self.visual_keymap, true)
+        {
+            self.buf.begin_group(self.cursor);
+            self.run_visual(command, count, arg);
+            if !self.is_insert() {
+                self.buf.end_group();
+            }
+        }
+    }
+
+    fn run_visual(&mut self, command: EditCommand, count: Option<usize>, arg: Option<char>) {
+        use EditCommand::*;
+        let Some(range) = self.selection_range() else {
+            return;
+        };
+        let Mode::Visual { anchor, lines } = self.mode else {
+            return;
+        };
+        match command {
+            c if c.is_motion() => self.move_cursor(c, count, arg),
+            Visual | VisualLine => {
+                let wanted = command == VisualLine;
+                self.mode = if wanted == lines {
+                    Mode::Normal
+                } else {
+                    Mode::Visual {
+                        anchor,
+                        lines: wanted,
+                    }
+                };
+            }
+            SwapEnds => {
+                self.mode = Mode::Visual {
+                    anchor: self.cursor,
+                    lines,
+                };
+                self.cursor = anchor;
+                self.want_col = self.cursor.col;
+            }
+            Delete | Change | Yank => {
+                self.mode = Mode::Normal;
+                let op = command.operator().expect("these are operators");
+                if op == EditOp::Yank {
+                    self.cursor = range.start;
+                }
+                self.apply_operator(op, range);
+            }
+            ToggleCase | Lowercase | Uppercase => {
+                self.mode = Mode::Normal;
+                let text = self.buf.text_between(range.start, range.end);
+                let changed: String = text
+                    .chars()
+                    .map(|ch| match command {
+                        Lowercase => ch.to_lowercase().collect::<String>(),
+                        Uppercase => ch.to_uppercase().collect(),
+                        _ if ch.is_lowercase() => ch.to_uppercase().collect(),
+                        _ => ch.to_lowercase().collect(),
+                    })
+                    .collect();
+                self.buf.replace(range.start, range.end, &changed);
+                self.cursor = range.start;
+            }
+            Join => {
+                self.mode = Mode::Normal;
+                self.cursor = Pos::new(range.start.line, 0);
+                self.join_lines((range.end.line - range.start.line + 1).max(2));
+            }
+            ReplaceChar => {
+                self.mode = Mode::Normal;
+                let Some(ch) = arg else { return };
+                let text = self.buf.text_between(range.start, range.end);
+                let replaced: String = text
+                    .split('\n')
+                    .map(|line| {
+                        use unicode_segmentation::UnicodeSegmentation;
+                        ch.to_string().repeat(line.graphemes(true).count())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.buf.replace(range.start, range.end, &replaced);
+                self.cursor = range.start;
+            }
+            PasteAfter | PasteBefore => {
+                self.mode = Mode::Normal;
+                let Some(register) = self.register.clone() else {
+                    self.message = Some("nothing to paste".into());
+                    return;
+                };
+                let deleted = self.range_text(range);
+                let text = match (register.linewise, range.linewise) {
+                    (true, false) => format!("\n{}\n", register.text.trim_end_matches('\n')),
+                    (true, true) => register.text.trim_end_matches('\n').to_string(),
+                    (false, true) => register.text.clone(),
+                    (false, false) => register.text.clone(),
+                };
+                self.buf.replace(range.start, range.end, &text);
+                self.cursor = range.start;
+                self.register = Some(Register {
+                    text: deleted,
+                    linewise: range.linewise,
+                });
+            }
+            _ => {}
+        }
     }
 
     fn note_find(&mut self, command: EditCommand, arg: Option<char>) {
@@ -1665,6 +1858,118 @@ mod tests {
     }
 
     #[test]
+    fn v_selects_characters_and_d_deletes_them() {
+        let mut e = ed("hello world\n");
+        keys(&mut e, "wv");
+        assert_eq!(e.visual_label(), Some("-- VISUAL --"));
+        keys(&mut e, "ll");
+        assert_eq!(e.selection(), Some((Pos::new(0, 6), Pos::new(0, 8), false)));
+        keys(&mut e, "d");
+        assert_eq!(text(&e), "hello ld\n");
+        assert!(e.selection().is_none());
+        keys(&mut e, "u");
+        assert_eq!(text(&e), "hello world\n");
+    }
+
+    #[test]
+    fn a_character_selection_can_span_lines() {
+        let mut e = ed("one two\nthree four\n");
+        keys(&mut e, "wvjd");
+        assert_eq!(
+            text(&e),
+            "one  four\n",
+            "j keeps the column, so the selection ends on the e"
+        );
+    }
+
+    #[test]
+    fn capital_v_selects_whole_lines() {
+        let mut e = ed("a\nb\nc\nd\n");
+        keys(&mut e, "jVj");
+        assert_eq!(e.visual_label(), Some("-- VISUAL LINE --"));
+        keys(&mut e, "d");
+        assert_eq!(text(&e), "a\nd\n");
+        keys(&mut e, "Vy");
+        keys(&mut e, "p");
+        assert_eq!(text(&e), "a\nd\nd\n");
+    }
+
+    #[test]
+    fn visual_change_yank_and_the_other_end() {
+        let mut e = ed("alpha beta gamma\n");
+        keys(&mut e, "wvec");
+        assert!(e.is_insert());
+        keys(&mut e, "B<esc>");
+        assert_eq!(text(&e), "alpha B gamma\n");
+        let mut e = ed("alpha beta\n");
+        keys(&mut e, "vey");
+        assert_eq!(
+            e.cursor(),
+            Pos::new(0, 0),
+            "yank leaves the cursor at the start"
+        );
+        keys(&mut e, "$p");
+        assert_eq!(text(&e), "alpha betaalpha\n");
+        let mut e = ed("abcdef\n");
+        keys(&mut e, "llvlo");
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+        keys(&mut e, "h");
+        assert_eq!(e.selection(), Some((Pos::new(0, 1), Pos::new(0, 3), false)));
+    }
+
+    #[test]
+    fn visual_case_replace_join_and_paste_over() {
+        let mut e = ed("Hello World\n");
+        keys(&mut e, "veU");
+        assert_eq!(text(&e), "HELLO World\n");
+        keys(&mut e, "wveu");
+        assert_eq!(text(&e), "HELLO world\n");
+        keys(&mut e, "0v$~");
+        assert_eq!(text(&e), "hello WORLD\n");
+        keys(&mut e, "0vlrx");
+        assert_eq!(text(&e), "xxllo WORLD\n");
+        let mut e = ed("a\nb\nc\n");
+        keys(&mut e, "VjjJ");
+        assert_eq!(text(&e), "a b c\n");
+        let mut e = ed("keep swap\n");
+        keys(&mut e, "yiw".replace("iw", "e").as_str());
+        keys(&mut e, "wvep");
+        assert_eq!(text(&e), "keep keep\n");
+    }
+
+    #[test]
+    fn escape_v_and_capital_v_leave_or_switch_the_selection() {
+        let mut e = ed("abc\n");
+        keys(&mut e, "v<esc>");
+        assert!(e.selection().is_none());
+        keys(&mut e, "vv");
+        assert!(e.selection().is_none(), "v again leaves");
+        keys(&mut e, "vV");
+        assert_eq!(
+            e.visual_label(),
+            Some("-- VISUAL LINE --"),
+            "V switches kind"
+        );
+        keys(&mut e, "V");
+        assert!(e.selection().is_none());
+        keys(&mut e, "vld<esc>");
+        assert_eq!(text(&e), "c\n");
+    }
+
+    #[test]
+    fn counts_and_find_motions_extend_the_selection() {
+        let mut e = ed("a,b,c,d\n");
+        keys(&mut e, "v2f,d");
+        assert_eq!(text(&e), "c,d\n");
+        let mut e = ed("1\n2\n3\n4\n5\n");
+        keys(&mut e, "V2jd");
+        assert_eq!(text(&e), "4\n5\n");
+        let mut e = ed("x\ny\nz\n");
+        keys(&mut e, "VGd");
+        assert_eq!(text(&e), "", "deleting every line empties the file");
+    }
+
+    #[test]
     fn dirty_tracks_edits_and_saving() {
         let mut e = ed("x\n");
         assert!(!e.dirty());
@@ -1796,8 +2101,9 @@ mod tests {
             "dd", "dw", "d$", "D", "cw", "cc", "C", "s", "S", "yy", "yw", "p", "P", "u", "<c-r>",
             "J", "~", "r", "i", "a", "A", "I", "o", "O", "<esc>", "<cr>", "<bs>", "<del>", "<tab>",
             "x", "z", "é", "👍", " ", "f", "t", ";", ",", "}", "{", "n", "N", "/a<cr>", "?b<cr>",
-            ":3<cr>", "2", "3", "d2j", "dk", "dG", "dgg", "<c-w>", "<c-u>", "<left>", "<right>",
-            "<up>", "<down>", "<c-d>", "<c-u>", "<c-f>", "<c-b>",
+            ":3<cr>", "2", "3", "d2j", "dk", "dG", "dgg", "v", "V", "o", "vjd", "Vy", "vU", "vrx",
+            "vp", "VJ", "vc", "<c-w>", "<c-u>", "<left>", "<right>", "<up>", "<down>", "<c-d>",
+            "<c-u>", "<c-f>", "<c-b>",
         ];
         struct Rng(u64);
         impl Rng {

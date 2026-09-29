@@ -157,6 +157,14 @@ fn draw_editor_footer(buf: &mut Buffer, area: Rect, editor: &crate::editor::Edit
     let right = format!("{pending}  {position}");
     let (text, color) = match (&editor.message, editor.is_insert()) {
         (Some(message), _) => (message.as_str(), WARN),
+        (None, _) if editor.visual_label().is_some() => (
+            if editor.visual_label() == Some("-- VISUAL LINE --") {
+                "-- VISUAL LINE --   d delete  c change  y yank  J join  Esc leaves"
+            } else {
+                "-- VISUAL --   d delete  c change  y yank  o other end  Esc leaves"
+            },
+            FG,
+        ),
         (None, true) => ("-- INSERT --   Esc back to normal", FG),
         (None, false) => (":w save   :q close   :wq both   i insert   u undo", DIM),
     };
@@ -426,6 +434,17 @@ fn draw_editor(
             number_style,
         );
         draw_code_line(buf, text_x, y, text_w, left, &editor.styled_line(index));
+        if let Some((from, to)) = selected_cols(editor, index) {
+            let tint = Style::new().bg(theme::rgb(theme::blend(color, BG, 0.35)));
+            for col in from.max(left)..to {
+                let x = text_x + (col - left) as u16;
+                if col - left >= text_w || !buf.area.contains(ratatui::layout::Position::new(x, y))
+                {
+                    break;
+                }
+                buf[(x, y)].set_style(tint);
+            }
+        }
         if current {
             let x = text_x + (cursor_col - left) as u16;
             if x < tree.x + p.x + p.width && buf.area.contains(ratatui::layout::Position::new(x, y))
@@ -443,6 +462,32 @@ fn draw_editor(
             }
         }
     }
+}
+
+/// Display columns of line `index` covered by the editor's selection, end exclusive. A selected
+/// empty line, or the line break of a line the selection continues past, shows as one cell.
+fn selected_cols(editor: &crate::editor::Editor, index: usize) -> Option<(usize, usize)> {
+    use crate::editor::display_col;
+    let (a, b, lines) = editor.selection()?;
+    if index < a.line || index > b.line {
+        return None;
+    }
+    let text = editor.line_text(index);
+    let width = display_col(text, usize::MAX);
+    if lines {
+        return Some((0, width.max(1)));
+    }
+    let from = if index == a.line {
+        display_col(text, a.col)
+    } else {
+        0
+    };
+    let to = if index == b.line {
+        display_col(text, b.col + 1).max(from + 1)
+    } else {
+        width + 1
+    };
+    Some((from, to))
 }
 
 /// Draws one line of code from display column `left`, expanding tabs and showing control characters as dots.
@@ -1274,6 +1319,41 @@ mod tests {
         assert!(
             center.trim_end().chars().count() >= 115,
             "the preview reaches the right edge: {center:?}"
+        );
+    }
+
+    #[test]
+    fn an_editor_selection_is_tinted_and_named_in_the_footer() {
+        let (_tmp, mut app) = edit("alpha beta\ngamma\n");
+        keys(&mut app, "wvl");
+        let (lines, buf) = rows(&app, 80, 11);
+        let row = row_of(&lines, "alpha beta");
+        let b = lines[row].find("beta").unwrap();
+        let x = lines[row][..b].chars().count() as u16;
+        let y = row as u16;
+        assert_ne!(buf[(x, y)].bg, theme::rgb(BG), "b is selected");
+        assert_ne!(buf[(x + 1, y)].bg, theme::rgb(BG), "e is under the cursor");
+        assert_eq!(buf[(x + 2, y)].bg, theme::rgb(BG), "t is outside");
+        assert_eq!(buf[(x - 2, y)].bg, theme::rgb(BG), "alpha is outside");
+        assert!(
+            footer(&lines).starts_with("-- VISUAL --"),
+            "{:?}",
+            footer(&lines)
+        );
+        keys(&mut app, "<esc>Vj");
+        let (lines, buf) = rows(&app, 80, 11);
+        let row = row_of(&lines, "gamma") as u16;
+        let g = lines[row as usize].find("gamma").unwrap();
+        let gx = lines[row as usize][..g].chars().count() as u16;
+        assert_ne!(
+            buf[(gx + 3, row)].bg,
+            theme::rgb(BG),
+            "whole lines are tinted"
+        );
+        assert!(
+            footer(&lines).starts_with("-- VISUAL LINE --"),
+            "{:?}",
+            footer(&lines)
         );
     }
 }
