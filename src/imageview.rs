@@ -133,16 +133,16 @@ impl Painter {
         }
     }
 
-    /// Cells the image takes when fitted into `available`, keeping its shape and never enlarging it.
-    /// Small pictures are enlarged up to four times so an icon is still recognisable.
+    /// Cells the image takes when fitted into `available`, keeping its shape.
+    /// Small pictures are enlarged at most twice, since every enlargement only makes bigger blocks.
     pub fn fitted_size(&self, image: &ImageData, available: Size) -> Option<Size> {
         let picker = self.picker.as_ref()?;
         let natural = Resize::natural_size(&image.0, picker.font_size());
         let bound = Size::new(
-            available.width.min(natural.width.saturating_mul(4)),
-            available.height.min(natural.height.saturating_mul(4)),
+            available.width.min(natural.width.saturating_mul(2)),
+            available.height.min(natural.height.saturating_mul(2)),
         );
-        let size = Resize::Scale(None).size_for(&image.0, picker.font_size(), bound);
+        let size = smooth().size_for(&image.0, picker.font_size(), bound);
         (size.width > 0 && size.height > 0).then_some(size)
     }
 
@@ -155,7 +155,7 @@ impl Painter {
         let key: Key = (path.to_path_buf(), Arc::as_ptr(&image.0) as usize, size);
         let mut cache = self.cache.borrow_mut();
         if cache.as_ref().is_none_or(|(k, _)| *k != key) {
-            let encoded = picker.new_protocol((*image.0).clone(), size, Resize::Scale(None));
+            let encoded = picker.new_protocol((*image.0).clone(), size, smooth());
             *cache = encoded.ok().map(|protocol| (key, protocol));
         }
         let Some((_, protocol)) = cache.as_ref() else {
@@ -177,6 +177,12 @@ impl Painter {
     pub fn take_drawn(&self) -> Option<Drawn> {
         self.drawn.borrow_mut().take()
     }
+}
+
+/// Scaling that averages neighbouring pixels. The library's default keeps one pixel out of many,
+/// which turns photos into jagged noise.
+fn smooth() -> Resize {
+    Resize::Scale(Some(image::imageops::FilterType::CatmullRom))
 }
 
 /// Pixel size of one terminal cell, from the size the terminal reports for its window.
@@ -271,7 +277,38 @@ mod tests {
     }
 
     #[test]
-    fn a_picture_fills_the_room_keeping_its_shape_and_icons_grow_at_most_four_times() {
+    fn a_fine_checkerboard_shrinks_to_grey_instead_of_random_black_and_white() {
+        let board = image::RgbImage::from_fn(1000, 1000, |x, y| {
+            if (x + y) % 2 == 0 {
+                image::Rgb([0, 0, 0])
+            } else {
+                image::Rgb([255, 255, 255])
+            }
+        });
+        let image = ImageData(Arc::new(DynamicImage::ImageRgb8(board)));
+        let painter = Painter::halfblocks();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 10));
+        painter.draw(
+            std::path::Path::new("/board.png"),
+            &image,
+            buf.area,
+            &mut buf,
+        );
+        let area = painter.take_drawn().unwrap().area;
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                for color in [buf[(x, y)].fg, buf[(x, y)].bg] {
+                    let ratatui::style::Color::Rgb(r, _, _) = color else {
+                        panic!("expected rgb, got {color:?}")
+                    };
+                    assert!((60..=195).contains(&r), "cell {x},{y} is {r}, not grey");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_picture_fills_the_room_keeping_its_shape_and_icons_grow_at_most_twice() {
         let painter = Painter::halfblocks();
         let big = painter
             .fitted_size(&picture(2000, 1000), Size::new(40, 40))
@@ -285,7 +322,7 @@ mod tests {
             icon.width > 4,
             "a 40 px icon is 4 cells wide at 10 px a cell, so it grows: {icon:?}"
         );
-        assert!(icon.width <= 16, "but no more than four times: {icon:?}");
+        assert!(icon.width <= 8, "but no more than twice: {icon:?}");
     }
 
     fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
