@@ -152,6 +152,11 @@ impl PreviewCache {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Open(PathBuf),
+    /// Put these files on the desktop clipboard.
+    Clipboard {
+        paths: Vec<PathBuf>,
+        cut: bool,
+    },
 }
 
 /// `levels[..=focus]` is the path; a directory under the cursor adds one preview level after it.

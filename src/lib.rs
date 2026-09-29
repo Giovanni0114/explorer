@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod app;
+pub mod clipboard;
 pub mod config;
 pub mod excmd;
 pub mod fileops;

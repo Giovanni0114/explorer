@@ -64,7 +64,13 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
             std::cmp::Ordering::Equal => Role::Focused,
             std::cmp::Ordering::Greater => Role::Preview,
         };
-        draw_column(buf, tree, center, *p, &levels[p.level], role);
+        let marks = Marks {
+            selection: app.selection(),
+            visual: (role == Role::Focused)
+                .then(|| app.visual_range())
+                .flatten(),
+        };
+        draw_column(buf, tree, center, *p, &levels[p.level], role, &marks);
     }
     for pair in placed.windows(2) {
         let (spec, color) = match (levels.get(pair[1].level), preview) {
@@ -115,9 +121,9 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App) {
     let y = area.y + area.height - 1;
     let width = usize::from(area.width.saturating_sub(2));
     if let Some(prompt) = app.prompt_view() {
-        let text = format!("{}{}", prompt.prefix, prompt.text);
+        let text = format!("{}{}", prompt.label, prompt.text);
         buf.set_stringn(area.x + 1, y, &text, width, Style::new().fg(theme::rgb(FG)));
-        let cursor_x = area.x + 2 + prompt.cursor_col as u16;
+        let cursor_x = area.x + 1 + (prompt.label.width() + prompt.cursor_col) as u16;
         if cursor_x < area.right() {
             let under = if prompt.cursor_col >= prompt.text.width() {
                 " "
@@ -132,10 +138,20 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App) {
         }
         return;
     }
-    let (text, color) = match &app.message {
-        Some(message) => (message.as_str(), WARN),
-        None => (
-            "j/k move   l enter   h back   / search   : command   ? help   q quit",
+    let running = app.running().map(|(label, percent)| match percent {
+        Some(p) => format!("{label}… {p}%  (Esc cancels)"),
+        None => format!("{label}…  (Esc cancels)"),
+    });
+    let conflict = app.conflict_prompt();
+    let (text, color) = match (&conflict, &app.message, &running) {
+        (Some(question), _, _) => (question.as_str(), FG),
+        (None, Some(message), _) => (message.as_str(), WARN),
+        (None, None, Some(progress)) => (progress.as_str(), FG),
+        (None, None, None) if app.is_visual() => {
+            ("-- VISUAL --   d trash   y yank   x cut   Esc leaves", FG)
+        }
+        (None, None, None) => (
+            "j/k move  l enter  h back  / search  : command  d y x p  u undo  ? help  q quit",
             DIM,
         ),
     };
@@ -344,7 +360,22 @@ fn natural_width(level: &Level) -> u16 {
     (longest + META_WIDTH + 3).clamp(MIN_WIDTH, MAX_WIDTH)
 }
 
-fn draw_column(buf: &mut Buffer, tree: Rect, center: u16, p: Placed, level: &Level, role: Role) {
+/// What the rows of a column need to know beyond the listing itself.
+struct Marks<'a> {
+    selection: &'a std::collections::BTreeSet<std::path::PathBuf>,
+    /// Rows covered by visual mode. Only the focused column has any.
+    visual: Option<std::ops::RangeInclusive<usize>>,
+}
+
+fn draw_column(
+    buf: &mut Buffer,
+    tree: Rect,
+    center: u16,
+    p: Placed,
+    level: &Level,
+    role: Role,
+    marks: &Marks,
+) {
     let color = level_color(level);
     let x = tree.x + p.x;
 
@@ -394,6 +425,26 @@ fn draw_column(buf: &mut Buffer, tree: Rect, center: u16, p: Placed, level: &Lev
                 },
                 style,
             );
+        } else if marks.visual.as_ref().is_some_and(|r| r.contains(&i)) {
+            style = style.bg(theme::rgb(theme::blend(color, BG, 0.24)));
+            fill(
+                buf,
+                Rect {
+                    x,
+                    y,
+                    width: p.width,
+                    height: 1,
+                },
+                style,
+            );
+        }
+        if marks.selection.contains(&level.dir.join(&entry.name)) {
+            let marker = if is_cursor && role == Role::Focused {
+                style
+            } else {
+                style.fg(theme::rgb(color)).add_modifier(Modifier::BOLD)
+            };
+            buf.set_string(x, y, "●", marker);
         }
 
         let meta = meta(entry);

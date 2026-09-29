@@ -6,6 +6,7 @@ use tx::{
     config::Config,
     keys::Keymap,
     marks::Marks,
+    ops::SystemTrash,
     runtime,
     shell::{self, Shell},
 };
@@ -44,6 +45,7 @@ fn main() -> io::Result<()> {
     let settings = Settings {
         show_hidden: config.show_hidden,
         marks: Marks::open(Marks::default_file()),
+        trash: std::sync::Arc::new(SystemTrash),
     };
     let mut app = App::with_settings(root, keymap, settings);
     app.message = notice;

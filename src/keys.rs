@@ -168,6 +168,17 @@ pub enum Command {
     FindRepeatBack,
     ExPrompt,
     Help,
+    Trash,
+    Yank,
+    Cut,
+    Visual,
+    ToggleSelect,
+    Paste,
+    PasteInto,
+    Rename,
+    NewEntry,
+    Undo,
+    Redo,
     SetMark,
     JumpMark,
     JumpBack,
@@ -177,7 +188,24 @@ pub enum Command {
     Abort,
 }
 
+/// Commands that act on the entries a motion covers, like vim's `d` and `y`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operator {
+    Trash,
+    Yank,
+    Cut,
+}
+
 impl Command {
+    pub fn operator(self) -> Option<Operator> {
+        match self {
+            Command::Trash => Some(Operator::Trash),
+            Command::Yank => Some(Operator::Yank),
+            Command::Cut => Some(Operator::Cut),
+            _ => None,
+        }
+    }
+
     /// Commands that only move the cursor, so an operator can take them as its range.
     pub fn is_motion(self) -> bool {
         matches!(
@@ -281,6 +309,45 @@ pub const COMMANDS: &[CommandInfo] = &[
     info("ex", Command::ExPrompt, "open the command line"),
     info("help", Command::Help, "show this help"),
     info(
+        "trash",
+        Command::Trash,
+        "move entries to the trash, like d{motion}; dd is this entry",
+    ),
+    info(
+        "yank",
+        Command::Yank,
+        "copy entries to the register, like y{motion}; yy is this entry",
+    ),
+    info(
+        "cut",
+        Command::Cut,
+        "cut entries to move them with paste, like x{motion}",
+    ),
+    info(
+        "visual",
+        Command::Visual,
+        "select a range of entries with the motions",
+    ),
+    info(
+        "select",
+        Command::ToggleSelect,
+        "select or unselect this entry and move down",
+    ),
+    info("paste", Command::Paste, "paste into this directory"),
+    info(
+        "paste_into",
+        Command::PasteInto,
+        "paste into the directory under the cursor",
+    ),
+    info("rename", Command::Rename, "rename this entry"),
+    info(
+        "new",
+        Command::NewEntry,
+        "create a file, or a folder when the name ends in /",
+    ),
+    info("undo", Command::Undo, "undo the last file operation"),
+    info("redo", Command::Redo, "redo an undone file operation"),
+    info(
         "mark",
         Command::SetMark,
         "set a mark, saved across sessions when uppercase",
@@ -351,6 +418,19 @@ const DEFAULT_KEYS: &[(&str, &str)] = &[
     (",", "find_repeat_back"),
     (":", "ex"),
     ("?", "help"),
+    ("d", "trash"),
+    ("y", "yank"),
+    ("x", "cut"),
+    ("v", "visual"),
+    ("<space>", "select"),
+    ("p", "paste"),
+    ("P", "paste_into"),
+    ("r", "rename"),
+    ("cw", "rename"),
+    ("cc", "rename"),
+    ("o", "new"),
+    ("u", "undo"),
+    ("<c-r>", "redo"),
     ("m", "mark"),
     ("'", "jump_mark"),
     ("`", "jump_mark"),
@@ -461,21 +541,44 @@ pub enum Fed {
         count: Option<usize>,
         arg: Option<char>,
     },
+    /// An operator with the motion that says which entries it covers. Without a motion the
+    /// operator was doubled (`dd`) and covers `count` entries from the cursor.
+    Operate {
+        operator: Operator,
+        motion: Option<(Command, Option<char>)>,
+        count: Option<usize>,
+    },
     Unbound,
 }
 
 const MAX_COUNT: usize = 99_999_999;
 
-/// Count prefix, multi-key sequences and character arguments.
+#[derive(Debug, Clone)]
+struct PendingOp {
+    operator: Operator,
+    count: Option<usize>,
+    label: String,
+}
+
+/// Count prefix, multi-key sequences, character arguments and operators waiting for a motion.
 #[derive(Debug, Default)]
 pub struct InputState {
     count: Option<usize>,
     keys: Vec<Key>,
     awaiting: Option<Command>,
+    operator: Option<PendingOp>,
+}
+
+fn combine(before: Option<usize>, after: Option<usize>) -> Option<usize> {
+    match (before, after) {
+        (None, None) => None,
+        (a, b) => Some((a.unwrap_or(1).saturating_mul(b.unwrap_or(1))).min(MAX_COUNT)),
+    }
 }
 
 impl InputState {
-    pub fn feed(&mut self, key: Key, keymap: &Keymap) -> Fed {
+    /// `visual` makes operators act at once on the selected range instead of waiting for a motion.
+    pub fn feed(&mut self, key: Key, keymap: &Keymap, visual: bool) -> Fed {
         let cancels = key.code == KeyCode::Esc && !key.ctrl && !key.alt;
         if self.is_pending() && cancels {
             self.reset();
@@ -483,12 +586,20 @@ impl InputState {
         }
         if let Some(command) = self.awaiting {
             let count = self.count;
+            let pending = self.operator.take();
             self.reset();
             return match key.typed_char() {
-                Some(c) => Fed::Run {
-                    command,
-                    count,
-                    arg: Some(c),
+                Some(c) => match pending {
+                    Some(op) => Fed::Operate {
+                        operator: op.operator,
+                        motion: Some((command, Some(c))),
+                        count: combine(op.count, count),
+                    },
+                    None => Fed::Run {
+                        command,
+                        count,
+                        arg: Some(c),
+                    },
                 },
                 None => Fed::Unbound,
             };
@@ -504,34 +615,81 @@ impl InputState {
         self.keys.push(key);
         match keymap.lookup(&self.keys) {
             Lookup::Prefix => Fed::Pending,
-            Lookup::Exact(command) if command.wants_char() => {
-                self.awaiting = Some(command);
-                Fed::Pending
-            }
-            Lookup::Exact(command) => {
-                let count = self.count;
-                self.reset();
-                Fed::Run {
-                    command,
-                    count,
-                    arg: None,
-                }
-            }
             Lookup::Unbound => {
                 self.reset();
                 Fed::Unbound
             }
+            Lookup::Exact(command) => self.exact(command, visual),
+        }
+    }
+
+    fn exact(&mut self, command: Command, visual: bool) -> Fed {
+        if let Some(pending) = self.operator.clone() {
+            if command.operator() == Some(pending.operator) {
+                let count = combine(pending.count, self.count);
+                self.reset();
+                return Fed::Operate {
+                    operator: pending.operator,
+                    motion: None,
+                    count,
+                };
+            }
+            if !command.is_motion() {
+                self.reset();
+                return Fed::Unbound;
+            }
+            if command.wants_char() {
+                self.awaiting = Some(command);
+                return Fed::Pending;
+            }
+            let count = combine(pending.count, self.count);
+            self.reset();
+            return Fed::Operate {
+                operator: pending.operator,
+                motion: Some((command, None)),
+                count,
+            };
+        }
+        if !visual && let Some(operator) = command.operator() {
+            self.operator = Some(PendingOp {
+                operator,
+                count: self.count.take(),
+                label: seq_label(&self.keys),
+            });
+            self.keys.clear();
+            return Fed::Pending;
+        }
+        if command.wants_char() {
+            self.awaiting = Some(command);
+            return Fed::Pending;
+        }
+        let count = self.count;
+        self.reset();
+        Fed::Run {
+            command,
+            count,
+            arg: None,
         }
     }
 
     pub fn is_pending(&self) -> bool {
-        self.count.is_some() || !self.keys.is_empty() || self.awaiting.is_some()
+        self.count.is_some()
+            || !self.keys.is_empty()
+            || self.awaiting.is_some()
+            || self.operator.is_some()
     }
 
-    /// The half-typed command as vim's showcmd would print it, such as `12g`.
+    /// The half-typed command as vim's showcmd would print it, such as `12g` or `2d3`.
     pub fn display(&self) -> String {
         let count = self.count.map(|c| c.to_string()).unwrap_or_default();
-        format!("{count}{}", seq_label(&self.keys))
+        let operator = self.operator.as_ref().map_or(String::new(), |op| {
+            format!(
+                "{}{}",
+                op.count.map(|c| c.to_string()).unwrap_or_default(),
+                op.label
+            )
+        });
+        format!("{operator}{count}{}", seq_label(&self.keys))
     }
 
     pub fn reset(&mut self) {
@@ -549,7 +707,7 @@ mod tests {
         let fed = Key::parse_seq(keys)
             .unwrap()
             .into_iter()
-            .map(|k| state.feed(k, &keymap))
+            .map(|k| state.feed(k, &keymap, false))
             .collect();
         (fed, state)
     }
@@ -711,6 +869,135 @@ mod tests {
         assert!(conflict.contains("gg is bound"), "{conflict}");
         let shadow = bad("g", "up");
         assert!(shadow.contains("g is bound"), "{shadow}");
+    }
+
+    fn operate(
+        operator: Operator,
+        motion: Option<(Command, Option<char>)>,
+        count: Option<usize>,
+    ) -> Fed {
+        Fed::Operate {
+            operator,
+            motion,
+            count,
+        }
+    }
+
+    #[test]
+    fn a_doubled_operator_covers_the_current_entry_or_a_count_of_them() {
+        assert_eq!(last("dd"), operate(Operator::Trash, None, None));
+        assert_eq!(last("yy"), operate(Operator::Yank, None, None));
+        assert_eq!(last("xx"), operate(Operator::Cut, None, None));
+        assert_eq!(last("3dd"), operate(Operator::Trash, None, Some(3)));
+        assert_eq!(last("d3d"), operate(Operator::Trash, None, Some(3)));
+        assert_eq!(last("2d3d"), operate(Operator::Trash, None, Some(6)));
+    }
+
+    #[test]
+    fn an_operator_waits_for_a_motion_and_combines_the_counts() {
+        let (fed, state) = feed_all("d");
+        assert_eq!(fed, [Fed::Pending]);
+        assert_eq!(state.display(), "d");
+        assert_eq!(
+            last("dj"),
+            operate(Operator::Trash, Some((Command::Down, None)), None)
+        );
+        assert_eq!(
+            last("d3j"),
+            operate(Operator::Trash, Some((Command::Down, None)), Some(3))
+        );
+        assert_eq!(
+            last("2d3j"),
+            operate(Operator::Trash, Some((Command::Down, None)), Some(6))
+        );
+        assert_eq!(
+            last("yG"),
+            operate(Operator::Yank, Some((Command::Last, None)), None)
+        );
+        assert_eq!(
+            last("dgg"),
+            operate(Operator::Trash, Some((Command::First, None)), None)
+        );
+        assert_eq!(
+            last("y5G"),
+            operate(Operator::Yank, Some((Command::Last, None)), Some(5))
+        );
+    }
+
+    #[test]
+    fn an_operator_can_take_a_letter_jump_as_its_motion() {
+        assert_eq!(
+            last("dfx"),
+            operate(Operator::Trash, Some((Command::Find, Some('x'))), None)
+        );
+        assert_eq!(
+            last("2yFa"),
+            operate(
+                Operator::Yank,
+                Some((Command::FindBack, Some('a'))),
+                Some(2)
+            )
+        );
+        let (_, state) = feed_all("df");
+        assert_eq!(state.display(), "df");
+    }
+
+    #[test]
+    fn a_command_that_is_not_a_motion_cancels_the_operator() {
+        for keys in ["dl", "dq", "dp", "dv", "d:", "d?"] {
+            let (fed, state) = feed_all(keys);
+            assert_eq!(*fed.last().unwrap(), Fed::Unbound, "{keys}");
+            assert!(!state.is_pending(), "{keys}");
+        }
+        assert_eq!(last("dlj"), run(Command::Down, None, None));
+    }
+
+    #[test]
+    fn escape_cancels_a_pending_operator_instead_of_quitting() {
+        for keys in ["d<esc>", "3d<esc>", "d2<esc>", "df<esc>"] {
+            let (fed, state) = feed_all(keys);
+            assert_eq!(*fed.last().unwrap(), Fed::Unbound, "{keys}");
+            assert!(!state.is_pending(), "{keys}");
+        }
+    }
+
+    #[test]
+    fn the_pending_display_shows_counts_operator_and_motion_keys() {
+        assert_eq!(feed_all("2d3").1.display(), "2d3");
+        assert_eq!(feed_all("3d").1.display(), "3d");
+        assert_eq!(feed_all("dg").1.display(), "dg");
+    }
+
+    #[test]
+    fn in_visual_mode_operators_run_at_once() {
+        let keymap = Keymap::default();
+        let mut state = InputState::default();
+        let d = Key::parse_seq("d").unwrap()[0];
+        assert_eq!(
+            state.feed(d, &keymap, true),
+            run(Command::Trash, None, None)
+        );
+        assert!(!state.is_pending());
+        let y = Key::parse_seq("3y").unwrap();
+        state.feed(y[0], &keymap, true);
+        assert_eq!(
+            state.feed(y[1], &keymap, true),
+            run(Command::Yank, Some(3), None)
+        );
+    }
+
+    #[test]
+    fn editing_keys_are_plain_commands() {
+        assert_eq!(last("p"), run(Command::Paste, None, None));
+        assert_eq!(last("P"), run(Command::PasteInto, None, None));
+        assert_eq!(last("r"), run(Command::Rename, None, None));
+        assert_eq!(last("cw"), run(Command::Rename, None, None));
+        assert_eq!(last("cc"), run(Command::Rename, None, None));
+        assert_eq!(last("o"), run(Command::NewEntry, None, None));
+        assert_eq!(last("u"), run(Command::Undo, None, None));
+        assert_eq!(last("<c-r>"), run(Command::Redo, None, None));
+        assert_eq!(last("v"), run(Command::Visual, None, None));
+        assert_eq!(last("<space>"), run(Command::ToggleSelect, None, None));
     }
 
     #[test]

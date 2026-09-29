@@ -344,6 +344,10 @@ impl PasteFlow {
         }
     }
 
+    pub fn mode(&self) -> PasteMode {
+        self.mode
+    }
+
     pub fn advance(&mut self, exists: &dyn Fn(&Path) -> bool) -> Step {
         while let Some(item) = self.queue.front() {
             if item.kind == ItemKind::Conflict && self.all.is_none() {

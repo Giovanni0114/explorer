@@ -1,17 +1,25 @@
 //! Interaction state on top of the [`Tree`]: modes, key handling and commands.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    ops::RangeInclusive,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ratatui::crossterm::event::KeyCode;
 
 use crate::{
     excmd::{self, Ex},
+    fileops::{FileOps, Finished, Job, JobSpec, PasteFlow, Step},
     jumps::Jumps,
-    keys::{Command, Fed, InputState, Key, Keymap},
+    keys::{Command, Fed, InputState, Key, Keymap, Operator},
     lineedit::LineEditor,
     marks::Marks,
     model::{Effect, Tree},
     motion,
+    ops::{Choice, NoTrash, Op, Outcome, PasteItem, PasteMode, Trasher, describe, plan_paste},
     prompt::{Prompt, PromptEvent, PromptKind},
     search,
 };
@@ -32,7 +40,16 @@ pub struct Response {
 
 enum Mode {
     Normal,
+    /// Selecting a range of entries in the focused column, from `anchor` to the cursor.
+    Visual {
+        anchor: usize,
+    },
     Prompt(Prompt),
+    /// A paste is waiting for the answer to a name clash.
+    Conflict {
+        flow: PasteFlow,
+        item: PasteItem,
+    },
     /// A read-only list drawn over the tree, such as the key reference.
     Overlay {
         title: String,
@@ -48,14 +65,24 @@ pub struct OverlayView<'a> {
 }
 
 /// Startup choices that are not key bindings.
-#[derive(Debug, Default)]
 pub struct Settings {
     pub show_hidden: bool,
     pub marks: Marks,
+    pub trash: Arc<dyn Trasher>,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            show_hidden: false,
+            marks: Marks::default(),
+            trash: Arc::new(NoTrash),
+        }
+    }
 }
 
 pub struct PromptView<'a> {
-    pub prefix: char,
+    pub label: &'static str,
     pub text: &'a str,
     pub cursor_col: usize,
 }
@@ -72,6 +99,9 @@ pub struct App {
     last_find: Option<(char, bool)>,
     marks: Marks,
     jumps: Jumps,
+    files: FileOps,
+    /// Entry to put the cursor on once its directory has been listed again.
+    pending_focus: Option<PathBuf>,
     /// Where the last jump started, for `''`.
     previous: Option<PathBuf>,
     /// Rows available to the tree, for page-sized motions.
@@ -96,6 +126,8 @@ impl App {
             last_find: None,
             marks: settings.marks,
             jumps: Jumps::default(),
+            files: FileOps::new(settings.trash),
+            pending_focus: None,
             previous: None,
             viewport: 24,
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -127,7 +159,7 @@ impl App {
     pub fn prompt_view(&self) -> Option<PromptView<'_>> {
         match &self.mode {
             Mode::Prompt(p) => Some(PromptView {
-                prefix: p.prefix(),
+                label: p.label(),
                 text: p.editor.text(),
                 cursor_col: p.editor.cursor_col(),
             }),
@@ -150,16 +182,123 @@ impl App {
         }
     }
 
+    pub fn selection(&self) -> &BTreeSet<PathBuf> {
+        self.files.selection()
+    }
+
+    pub fn is_visual(&self) -> bool {
+        matches!(self.mode, Mode::Visual { .. })
+    }
+
+    /// Rows of the focused column covered by visual mode.
+    pub fn visual_range(&self) -> Option<RangeInclusive<usize>> {
+        let Mode::Visual { anchor } = self.mode else {
+            return None;
+        };
+        let level = self.tree.focused();
+        let last = level.entries.len().checked_sub(1)?;
+        let (a, b) = (anchor.min(last), level.cursor.min(last));
+        Some(a.min(b)..=a.max(b))
+    }
+
+    /// The running job's name and progress, if it can tell.
+    pub fn running(&self) -> Option<(&str, Option<u8>)> {
+        self.files.running()
+    }
+
+    /// The question a paste is waiting on.
+    pub fn conflict_prompt(&self) -> Option<String> {
+        let Mode::Conflict { item, .. } = &self.mode else {
+            return None;
+        };
+        let name = item.to.file_name().unwrap_or_default().to_string_lossy();
+        Some(format!(
+            "{name} exists: [s]kip [o]verwrite [k]eep both, capitals for all, Esc cancels"
+        ))
+    }
+
+    pub fn trasher(&self) -> Arc<dyn Trasher> {
+        self.files.trasher()
+    }
+
+    pub fn take_jobs(&mut self) -> Vec<Job> {
+        self.files.take_jobs()
+    }
+
+    pub fn job_progress(&mut self, id: u64, done: u64, total: u64) {
+        self.files.progress(id, done, total);
+    }
+
+    /// A job is over. Its directories are listed again and its outcome becomes the message.
+    pub fn finish_job(&mut self, id: u64, outcome: Outcome) {
+        let Some(Finished {
+            message,
+            reload,
+            focus_on,
+        }) = self.files.finish(id, outcome)
+        else {
+            return;
+        };
+        for dir in reload {
+            self.tree.reload(&dir);
+        }
+        self.message = Some(message);
+        self.pending_focus = focus_on;
+    }
+
     /// Lists a directory load that finished. Also surfaces anything the tree wants to say, like a missing bookmark target.
     pub fn finish_load(&mut self, dir: &Path, result: std::io::Result<Vec<crate::model::Entry>>) {
         self.tree.finish_load(dir, result);
+        self.follow_pending_focus(dir);
         self.pull_notice();
     }
 
-    /// Finishes every pending listing on this thread. For tests.
+    fn follow_pending_focus(&mut self, listed: &Path) {
+        let Some(target) = self.pending_focus.clone() else {
+            return;
+        };
+        let has_it = self.tree.levels().iter().any(|l| {
+            l.dir == listed
+                && target
+                    .file_name()
+                    .is_some_and(|n| l.entries.iter().any(|e| e.name == n))
+        });
+        if target.parent() == Some(listed) && has_it {
+            self.pending_focus = None;
+            self.tree.reveal(&target);
+        }
+    }
+
+    /// Finishes every pending listing, preview and job on this thread. For tests.
     #[cfg(test)]
     pub fn settle(&mut self) {
-        self.tree.settle();
+        loop {
+            let mut progressed = false;
+            for r in self.tree.take_requests() {
+                progressed = true;
+                let result = crate::fsread::read_dir(&r.dir, r.keep.as_deref(), r.hidden);
+                self.finish_load(&r.dir, result);
+            }
+            for r in self.tree.take_preview_requests() {
+                progressed = true;
+                let result = crate::preview::build(&r.path);
+                self.tree.finish_preview(&r, result);
+            }
+            for job in self.files.take_jobs() {
+                progressed = true;
+                let trash = self.files.trasher();
+                let ctx = crate::ops::Ctx {
+                    trash: &*trash,
+                    cancel: &job.cancel,
+                    progress: &|_| {},
+                };
+                let outcome = crate::ops::run_job(&job.ops, &ctx, |_| {});
+                self.finish_job(job.id, outcome);
+            }
+            if !progressed {
+                break;
+            }
+        }
         self.pull_notice();
     }
 
@@ -171,26 +310,61 @@ impl App {
 
     pub fn press(&mut self, key: Key) -> Response {
         self.message = None;
+        self.pending_focus = None;
         let response = match self.mode {
             Mode::Prompt(_) => self.press_prompt(key),
+            Mode::Conflict { .. } => {
+                self.press_conflict(key);
+                Response::default()
+            }
             Mode::Overlay { .. } => {
                 self.press_overlay(key);
                 Response::default()
             }
-            Mode::Normal => match self.input.feed(key, &self.keymap) {
-                Fed::Run {
-                    command,
-                    count,
-                    arg,
-                } => self.run(command, count, arg),
-                Fed::Pending | Fed::Unbound => Response::default(),
-            },
+            Mode::Normal | Mode::Visual { .. } => self.press_normal(key),
         };
         self.pull_notice();
         response
     }
 
+    fn press_normal(&mut self, key: Key) -> Response {
+        let escape = key.code == KeyCode::Esc && !key.ctrl && !key.alt;
+        let interrupt = key.code == KeyCode::Char('c') && key.ctrl;
+        if (escape || interrupt) && !self.input.is_pending() {
+            if self.files.cancel() {
+                self.message = Some("cancelling…".into());
+                return Response::default();
+            }
+            if escape && self.is_visual() {
+                self.mode = Mode::Normal;
+                return Response::default();
+            }
+        }
+        match self.input.feed(key, &self.keymap, self.is_visual()) {
+            Fed::Run {
+                command,
+                count,
+                arg,
+            } => self.run(command, count, arg),
+            Fed::Operate {
+                operator,
+                motion,
+                count,
+            } => self.operate(operator, motion, count),
+            Fed::Pending | Fed::Unbound => Response::default(),
+        }
+    }
+
     fn run(&mut self, command: Command, count: Option<usize>, arg: Option<char>) -> Response {
+        let keeps_visual = command.is_motion()
+            || command.operator().is_some()
+            || matches!(
+                command,
+                Command::Visual | Command::PreviewDown | Command::PreviewUp
+            );
+        if self.is_visual() && !keeps_visual {
+            self.mode = Mode::Normal;
+        }
         let before = self.tree.location();
         let response = self.execute(command, count, arg);
         let jumps = matches!(
@@ -270,6 +444,22 @@ impl App {
             Command::Search => self.open_prompt(PromptKind::Search),
             Command::ExPrompt => self.open_prompt(PromptKind::Ex),
             Command::Help => self.open_help(),
+            Command::Trash | Command::Yank | Command::Cut => {
+                let operator = command.operator().expect("these are operators");
+                let targets = match self.visual_range() {
+                    Some(range) => self.paths_in(range),
+                    None => self.default_targets(),
+                };
+                return self.apply_operator(operator, targets);
+            }
+            Command::Visual => self.toggle_visual(),
+            Command::ToggleSelect => self.toggle_selected(),
+            Command::Paste => self.paste(false),
+            Command::PasteInto => self.paste(true),
+            Command::Rename => self.start_rename(),
+            Command::NewEntry => self.open_prompt(PromptKind::New),
+            Command::Undo => self.report(FileOps::undo),
+            Command::Redo => self.report(FileOps::redo),
             Command::SetMark => {
                 if let Some(name) = arg {
                     let here = self.tree.location();
@@ -286,6 +476,14 @@ impl App {
             Command::JumpBack => self.walk_jumps(n, false),
             Command::JumpForward => self.walk_jumps(n, true),
             Command::ToggleHidden => self.tree.set_show_hidden(!self.tree.show_hidden()),
+            Command::Quit | Command::Abort if self.files.running().is_some() => {
+                let label = self
+                    .files
+                    .running()
+                    .map_or("", |(label, _)| label)
+                    .to_string();
+                self.message = Some(format!("still {label}, Esc cancels it"));
+            }
             Command::Quit => {
                 return Response {
                     effect: None,
@@ -300,6 +498,300 @@ impl App {
             }
         }
         Response::default()
+    }
+
+    fn paths_in(&self, range: RangeInclusive<usize>) -> Vec<PathBuf> {
+        let level = self.tree.focused();
+        level.entries[range]
+            .iter()
+            .map(|e| level.dir.join(&e.name))
+            .collect()
+    }
+
+    /// What an action without a motion applies to: the selection, or else the entry under the cursor.
+    fn default_targets(&self) -> Vec<PathBuf> {
+        if !self.files.selection().is_empty() {
+            return self.files.selection().iter().cloned().collect();
+        }
+        self.tree
+            .focused()
+            .selected()
+            .map(|_| vec![self.tree.location()])
+            .unwrap_or_default()
+    }
+
+    fn toggle_visual(&mut self) {
+        self.mode = match self.mode {
+            Mode::Visual { .. } => Mode::Normal,
+            _ => Mode::Visual {
+                anchor: self.tree.focused().cursor,
+            },
+        };
+    }
+
+    fn toggle_selected(&mut self) {
+        if self.tree.focused().selected().is_some() {
+            self.files.toggle_selected(self.tree.location());
+            self.tree.move_by(1);
+        }
+    }
+
+    /// An operator with a motion covers the entries between the cursor and where the motion lands.
+    /// A doubled operator covers the selection, or `count` entries from the cursor.
+    fn operate(
+        &mut self,
+        operator: Operator,
+        motion: Option<(Command, Option<char>)>,
+        count: Option<usize>,
+    ) -> Response {
+        let level = self.tree.focused();
+        let Some(last) = level.entries.len().checked_sub(1) else {
+            self.message = Some("nothing here".into());
+            return Response::default();
+        };
+        let cursor = level.cursor;
+        let range = match motion {
+            Some((command, arg)) => {
+                if let (Command::Find | Command::FindBack, Some(letter)) = (command, arg) {
+                    self.last_find = Some((letter, command == Command::Find));
+                }
+                let ctx = motion::Ctx {
+                    entries: &level.entries,
+                    cursor,
+                    viewport: self.viewport,
+                    last_search: self.last_search.as_deref(),
+                    last_find: self.last_find,
+                };
+                match motion::target(command, count, arg, &ctx) {
+                    Ok(target) => cursor.min(target)..=cursor.max(target),
+                    Err(message) => {
+                        self.message = Some(message);
+                        return Response::default();
+                    }
+                }
+            }
+            None if !self.files.selection().is_empty() && count.is_none() => {
+                return self.apply_operator(operator, self.default_targets());
+            }
+            None => cursor..=(cursor.saturating_add(count.unwrap_or(1) - 1)).min(last),
+        };
+        let targets = self.paths_in(range);
+        self.apply_operator(operator, targets)
+    }
+
+    fn apply_operator(&mut self, operator: Operator, targets: Vec<PathBuf>) -> Response {
+        if self.is_visual() {
+            self.mode = Mode::Normal;
+        }
+        if targets.is_empty() {
+            self.message = Some("nothing to act on".into());
+            return Response::default();
+        }
+        self.files.clear_selection();
+        let what = noun(&targets);
+        match operator {
+            Operator::Yank | Operator::Cut => {
+                let cut = operator == Operator::Cut;
+                let mode = if cut { PasteMode::Cut } else { PasteMode::Copy };
+                self.files.set_register(targets.clone(), mode);
+                let verb = if cut { "cut" } else { "yanked" };
+                self.message = Some(format!("{verb} {what}"));
+                Response {
+                    effect: Some(Effect::Clipboard {
+                        paths: targets,
+                        cut,
+                    }),
+                    exit: None,
+                }
+            }
+            Operator::Trash => {
+                self.submit(JobSpec {
+                    label: format!("deleting {what}"),
+                    success: format!("moved {what} to the trash, u undoes it"),
+                    ops: targets.into_iter().map(|path| Op::Trash { path }).collect(),
+                    focus_on: None,
+                    clears_register: false,
+                });
+                Response::default()
+            }
+        }
+    }
+
+    fn submit(&mut self, spec: JobSpec) {
+        if let Err(message) = self.files.start(spec) {
+            self.message = Some(message);
+        }
+    }
+
+    fn report(&mut self, action: fn(&mut FileOps) -> Result<(), String>) {
+        if let Err(message) = action(&mut self.files) {
+            self.message = Some(message);
+        }
+    }
+
+    fn paste(&mut self, into_hovered: bool) {
+        let Some(register) = self.files.register() else {
+            self.message = Some("nothing to paste".into());
+            return;
+        };
+        let (sources, mode) = (register.paths.clone(), register.mode);
+        let level = self.tree.focused();
+        let hovered = level
+            .selected()
+            .filter(|e| e.is_dir())
+            .map(|e| level.dir.join(&e.name));
+        let dest = match (into_hovered, hovered) {
+            (true, Some(dir)) => dir,
+            _ => level.dir.clone(),
+        };
+        let items = plan_paste(&sources, &dest, mode, &exists);
+        self.drive_paste(PasteFlow::new(items, mode), None);
+    }
+
+    fn drive_paste(&mut self, mut flow: PasteFlow, answer: Option<(Choice, bool)>) {
+        let mode = flow.mode();
+        let step = match answer {
+            Some((choice, all)) => flow.choose(choice, all, &exists),
+            None => flow.advance(&exists),
+        };
+        match step {
+            Step::Ask(item) => self.mode = Mode::Conflict { flow, item },
+            Step::Failed(message) => {
+                self.mode = Mode::Normal;
+                self.message = Some(message);
+            }
+            Step::Ready(ops) => {
+                self.mode = Mode::Normal;
+                let moving = mode == PasteMode::Cut;
+                let focus_on = ops.iter().rev().find_map(|op| match op {
+                    Op::Copy { to, .. } | Op::Move { to, .. } => Some(to.clone()),
+                    _ => None,
+                });
+                let pasted = ops
+                    .iter()
+                    .filter(|op| matches!(op, Op::Copy { .. } | Op::Move { .. }))
+                    .count();
+                let what = format!("{pasted} item{}", if pasted == 1 { "" } else { "s" });
+                if pasted == 0 {
+                    self.message = Some("nothing to paste here".into());
+                    return;
+                }
+                let (label, done) = if moving {
+                    ("moving", "moved")
+                } else {
+                    ("pasting", "pasted")
+                };
+                self.submit(JobSpec {
+                    label: format!("{label} {what}"),
+                    success: format!("{done} {what}"),
+                    ops,
+                    focus_on,
+                    clears_register: moving,
+                });
+            }
+        }
+    }
+
+    fn press_conflict(&mut self, key: Key) {
+        let Mode::Conflict { flow, item } = std::mem::replace(&mut self.mode, Mode::Normal) else {
+            return;
+        };
+        let answer = match key.typed_char() {
+            Some('s') => Some((Choice::Skip, false)),
+            Some('o') => Some((Choice::Overwrite, false)),
+            Some('k') => Some((Choice::KeepBoth, false)),
+            Some('S') => Some((Choice::Skip, true)),
+            Some('O') => Some((Choice::Overwrite, true)),
+            Some('K') => Some((Choice::KeepBoth, true)),
+            _ => None,
+        };
+        match answer {
+            Some(answer) => self.drive_paste(flow, Some(answer)),
+            None if key.code == KeyCode::Esc || (key.ctrl && key.code == KeyCode::Char('c')) => {
+                self.message = Some("paste cancelled".into());
+            }
+            None => self.mode = Mode::Conflict { flow, item },
+        }
+    }
+
+    fn start_rename(&mut self) {
+        let Some(entry) = self.tree.focused().selected() else {
+            self.message = Some("nothing to rename".into());
+            return;
+        };
+        self.mode = Mode::Prompt(Prompt {
+            kind: PromptKind::Rename,
+            editor: LineEditor::with_text(&entry.display_name()),
+            origin: None,
+            subject: Some(self.tree.location()),
+        });
+    }
+
+    fn confirm_rename(&mut self, subject: Option<&Path>, text: &str) {
+        let Some(from) = subject else { return };
+        let name = match validate_name(text) {
+            Ok(name) => name,
+            Err(message) => return self.message = Some(message),
+        };
+        let to = from.with_file_name(name);
+        if to == from {
+            return;
+        }
+        if fs::symlink_metadata(&to).is_ok() {
+            return self.message = Some(format!("{name} already exists"));
+        }
+        self.submit(JobSpec {
+            label: format!("renaming to {name}"),
+            success: format!("renamed to {name}"),
+            ops: vec![Op::Move {
+                from: from.to_path_buf(),
+                to: to.clone(),
+            }],
+            focus_on: Some(to),
+            clears_register: false,
+        });
+    }
+
+    fn create_entry(&mut self, text: &str, is_dir: bool) {
+        let name = match validate_name(text) {
+            Ok(name) => name,
+            Err(message) => return self.message = Some(message),
+        };
+        let path = self.tree.focused().dir.join(name);
+        if fs::symlink_metadata(&path).is_ok() {
+            return self.message = Some(format!("{name} already exists"));
+        }
+        let op = if is_dir {
+            Op::Mkdir { path: path.clone() }
+        } else {
+            Op::Touch { path: path.clone() }
+        };
+        self.submit(JobSpec {
+            label: describe(&op),
+            success: format!("created {name}{}", if is_dir { "/" } else { "" }),
+            ops: vec![op],
+            focus_on: Some(path),
+            clears_register: false,
+        });
+    }
+
+    fn chmod(&mut self, mode: u32) {
+        let targets = self.default_targets();
+        if targets.is_empty() {
+            return self.message = Some("nothing to change".into());
+        }
+        self.files.clear_selection();
+        let what = noun(&targets);
+        self.submit(JobSpec {
+            label: format!("changing the mode of {what}"),
+            success: format!("mode of {what} is now {mode:o}"),
+            ops: targets
+                .into_iter()
+                .map(|path| Op::Chmod { path, mode })
+                .collect(),
+            focus_on: None,
+            clears_register: false,
+        });
     }
 
     fn open_help(&mut self) {
@@ -396,12 +888,13 @@ impl App {
     fn open_prompt(&mut self, kind: PromptKind) {
         let origin = match kind {
             PromptKind::Search => self.tree.focused().selected().map(|e| e.name.clone()),
-            PromptKind::Ex => None,
+            PromptKind::Ex | PromptKind::Rename | PromptKind::New => None,
         };
         self.mode = Mode::Prompt(Prompt {
             kind,
             editor: LineEditor::default(),
             origin,
+            subject: None,
         });
     }
 
@@ -434,6 +927,18 @@ impl App {
                         Response::default()
                     }
                     PromptKind::Ex => self.run_ex(prompt.editor.text()),
+                    PromptKind::Rename => {
+                        self.confirm_rename(prompt.subject.as_deref(), prompt.editor.text());
+                        Response::default()
+                    }
+                    PromptKind::New => {
+                        let text = prompt.editor.text();
+                        match text.strip_suffix('/') {
+                            Some(name) => self.create_entry(name, true),
+                            None => self.create_entry(text, false),
+                        }
+                        Response::default()
+                    }
                 };
             }
         }
@@ -486,6 +991,11 @@ impl App {
             Ok(Ex::Abort) => return exit(Exit::Abort),
             Ok(Ex::Help) => self.open_help(),
             Ok(Ex::Marks) => self.open_marks(),
+            Ok(Ex::Undo) => self.report(FileOps::undo),
+            Ok(Ex::Redo) => self.report(FileOps::redo),
+            Ok(Ex::Mkdir(name)) => self.create_entry(&name, true),
+            Ok(Ex::Touch(name)) => self.create_entry(&name, false),
+            Ok(Ex::Chmod(mode)) => self.chmod(mode),
             Ok(Ex::SetHidden(setting)) => {
                 let on = setting.unwrap_or(!self.tree.show_hidden());
                 self.tree.set_show_hidden(on);
@@ -522,6 +1032,32 @@ impl App {
             (KeyCode::Esc | KeyCode::Enter, _) | (_, Some('q' | '?')) => self.mode = Mode::Normal,
             _ => {}
         }
+    }
+}
+
+fn exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn noun(paths: &[PathBuf]) -> String {
+    match paths {
+        [one] => one
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        many => format!("{} items", many.len()),
+    }
+}
+
+/// A single path component, so a rename or new file cannot escape the directory.
+fn validate_name(text: &str) -> Result<&str, String> {
+    match text {
+        _ if text.trim().is_empty() => Err("the name is empty".into()),
+        "." | ".." => Err(format!("{text} is not a usable name")),
+        _ if text.contains('/') => Err("names cannot contain /".into()),
+        _ if text.contains('\0') => Err("names cannot contain NUL".into()),
+        _ => Ok(text),
     }
 }
 
@@ -1127,5 +1663,494 @@ mod tests {
         assert_eq!(selected(&app), "notes.txt");
         keys(&mut app, "<c-o>");
         assert_eq!(here(&app), tmp.path().join("docs"));
+    }
+
+    struct Files {
+        root: tempfile::TempDir,
+        trash: Arc<crate::ops::FakeTrash>,
+        _trash_dir: tempfile::TempDir,
+        app: App,
+    }
+
+    impl Files {
+        fn p(&self, rel: &str) -> PathBuf {
+            self.root.path().join(rel)
+        }
+
+        fn has(&self, rel: &str) -> bool {
+            fs::symlink_metadata(self.p(rel)).is_ok()
+        }
+
+        fn read(&self, rel: &str) -> String {
+            fs::read_to_string(self.p(rel)).unwrap()
+        }
+
+        fn keys(&mut self, text: &str) -> Response {
+            keys(&mut self.app, text)
+        }
+
+        fn names(&self) -> Vec<String> {
+            self.app
+                .tree()
+                .focused()
+                .entries
+                .iter()
+                .map(|e| e.display_name())
+                .collect()
+        }
+    }
+
+    /// dir1/ dir2/ a.txt b.txt c.txt, with a fake trash so no real one is touched.
+    fn files() -> Files {
+        let root = tempfile::tempdir().unwrap();
+        for d in ["dir1", "dir2"] {
+            fs::create_dir(root.path().join(d)).unwrap();
+        }
+        fs::write(root.path().join("dir1/inner.txt"), "inner").unwrap();
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.path().join(f), format!("content of {f}")).unwrap();
+        }
+        let trash_dir = tempfile::tempdir().unwrap();
+        let trash = Arc::new(crate::ops::FakeTrash::new(&trash_dir.path().join("t")));
+        let mut app = App::with_settings(
+            root.path().to_path_buf(),
+            Keymap::default(),
+            Settings {
+                trash: trash.clone(),
+                ..Settings::default()
+            },
+        );
+        app.settle();
+        Files {
+            root,
+            trash,
+            _trash_dir: trash_dir,
+            app,
+        }
+    }
+
+    #[test]
+    fn dd_trashes_the_entry_and_u_and_ctrl_r_undo_and_redo_it() {
+        let mut f = files();
+        f.keys("2jdd");
+        assert!(!f.has("a.txt"));
+        assert_eq!(f.trash.item_count(), 1);
+        assert_eq!(
+            f.app.message.as_deref(),
+            Some("moved a.txt to the trash, u undoes it")
+        );
+        f.keys("u");
+        assert_eq!(f.read("a.txt"), "content of a.txt");
+        assert_eq!(f.app.message.as_deref(), Some("undid deleting a.txt"));
+        f.keys("<c-r>");
+        assert!(!f.has("a.txt"));
+        f.keys("uu");
+        assert_eq!(f.app.message.as_deref(), Some("nothing to undo"));
+    }
+
+    #[test]
+    fn operators_with_motions_cover_the_entries_between_cursor_and_target() {
+        let mut f = files();
+        f.keys("2jd1j");
+        assert!(!f.has("a.txt") && !f.has("b.txt") && f.has("c.txt"));
+        f.keys("uD");
+        let mut f = files();
+        f.keys("3jdk");
+        assert!(!f.has("a.txt") && !f.has("b.txt") && f.has("c.txt"));
+        let mut f = files();
+        f.keys("3jdG");
+        assert!(!f.has("b.txt") && !f.has("c.txt") && f.has("a.txt"));
+        let mut f = files();
+        f.keys("2jdgg");
+        assert!(!f.has("dir1") && !f.has("dir2") && !f.has("a.txt") && f.has("b.txt"));
+        let mut f = files();
+        f.keys("2j3dd");
+        assert!(!f.has("a.txt") && !f.has("b.txt") && !f.has("c.txt"));
+        assert!(f.has("dir1") && f.has("dir2"));
+    }
+
+    #[test]
+    fn an_operator_can_reach_to_a_letter_jump() {
+        let mut f = files();
+        f.keys("2jdfc");
+        assert!(!f.has("a.txt") && !f.has("b.txt") && !f.has("c.txt"));
+        assert!(f.has("dir1") && f.has("dir2"));
+    }
+
+    #[test]
+    fn a_failed_motion_deletes_nothing() {
+        let mut f = files();
+        f.keys("2jdfz");
+        assert_eq!(f.app.message.as_deref(), Some("no name starts with z"));
+        assert!(f.has("a.txt"));
+        f.keys("d/");
+        assert!(f.has("a.txt"), "a prompt is not a motion");
+    }
+
+    #[test]
+    fn yank_and_paste_copy_into_the_directory_you_are_in() {
+        let mut f = files();
+        let response = f.keys("2jyy");
+        assert_eq!(
+            response.effect,
+            Some(Effect::Clipboard {
+                paths: vec![f.p("a.txt")],
+                cut: false
+            })
+        );
+        f.keys("gg");
+        f.keys("l");
+        f.keys("p");
+        assert_eq!(f.read("dir1/a.txt"), "content of a.txt");
+        assert!(f.has("a.txt"), "yank leaves the original");
+        assert_eq!(
+            f.app.tree().location(),
+            f.p("dir1/a.txt"),
+            "the cursor follows the new file"
+        );
+        f.keys("p");
+        let prompt = f.app.conflict_prompt().expect("a second paste clashes");
+        assert!(prompt.starts_with("a.txt exists"), "{prompt}");
+        f.keys("k");
+        assert_eq!(f.read("dir1/a (1).txt"), "content of a.txt");
+        f.keys("p");
+        f.keys("s");
+        assert!(!f.has("dir1/a (2).txt"));
+        assert_eq!(f.app.message.as_deref(), Some("nothing to paste here"));
+    }
+
+    #[test]
+    fn cut_and_paste_move_and_empty_the_register() {
+        let mut f = files();
+        f.keys("3jxx");
+        f.keys("ggjl");
+        f.keys("p");
+        assert_eq!(f.read("dir2/b.txt"), "content of b.txt");
+        assert!(!f.has("b.txt"));
+        f.keys("p");
+        assert_eq!(f.app.message.as_deref(), Some("nothing to paste"));
+        f.keys("u");
+        assert!(f.has("b.txt") && !f.has("dir2/b.txt"));
+    }
+
+    #[test]
+    fn capital_p_pastes_into_the_directory_under_the_cursor() {
+        let mut f = files();
+        f.keys("3jyygg");
+        f.keys("jP");
+        assert!(f.has("dir2/b.txt"));
+        assert_eq!(
+            f.app.tree().location(),
+            f.p("dir2/b.txt"),
+            "the cursor follows the pasted file"
+        );
+    }
+
+    #[test]
+    fn cutting_into_the_same_folder_does_nothing() {
+        let mut f = files();
+        f.keys("2jxxp");
+        assert_eq!(f.app.message.as_deref(), Some("nothing to paste here"));
+        assert!(f.has("a.txt"));
+    }
+
+    #[test]
+    fn copying_into_the_same_folder_makes_a_numbered_copy() {
+        let mut f = files();
+        f.keys("2jyyp");
+        assert_eq!(f.read("a (1).txt"), "content of a.txt");
+        assert!(f.app.conflict_prompt().is_none());
+    }
+
+    #[test]
+    fn overwrite_trashes_the_old_file_first_and_undo_brings_both_states_back() {
+        let mut f = files();
+        fs::write(f.p("dir2/a.txt"), "old version").unwrap();
+        let dir2 = f.p("dir2");
+        f.app.tree_mut().reload(&dir2);
+        f.app.settle();
+        f.keys("2jyyggj");
+        f.keys("lp");
+        assert!(f.app.conflict_prompt().is_some());
+        f.keys("o");
+        assert_eq!(f.read("dir2/a.txt"), "content of a.txt");
+        assert_eq!(
+            f.trash.item_count(),
+            1,
+            "the old file is in the trash, not gone"
+        );
+        f.keys("u");
+        assert_eq!(f.read("dir2/a.txt"), "old version");
+        assert_eq!(
+            f.trash.item_count(),
+            1,
+            "the pasted copy waits in the trash"
+        );
+    }
+
+    #[test]
+    fn an_answer_in_capitals_applies_to_every_clash() {
+        let mut f = files();
+        for name in ["a.txt", "b.txt"] {
+            fs::write(f.p("dir2").join(name), "old").unwrap();
+        }
+        let dir2 = f.p("dir2");
+        f.app.tree_mut().reload(&dir2);
+        f.app.settle();
+        f.keys("2jv1jy");
+        f.keys("ggjlp");
+        f.keys("K");
+        assert!(f.app.conflict_prompt().is_none(), "one answer settled both");
+        assert_eq!(f.read("dir2/a (1).txt"), "content of a.txt");
+        assert_eq!(f.read("dir2/b (1).txt"), "content of b.txt");
+        assert_eq!(f.read("dir2/a.txt"), "old");
+    }
+
+    #[test]
+    fn escape_cancels_a_paste_that_is_waiting_for_an_answer() {
+        let mut f = files();
+        fs::write(f.p("dir2/a.txt"), "old").unwrap();
+        let dir2 = f.p("dir2");
+        f.app.tree_mut().reload(&dir2);
+        f.app.settle();
+        f.keys("2jyyggjlp");
+        f.keys("x");
+        assert!(
+            f.app.conflict_prompt().is_some(),
+            "other keys do not answer"
+        );
+        f.keys("<esc>");
+        assert!(f.app.conflict_prompt().is_none());
+        assert_eq!(f.app.message.as_deref(), Some("paste cancelled"));
+        assert_eq!(f.read("dir2/a.txt"), "old");
+    }
+
+    #[test]
+    fn pasting_a_directory_into_itself_is_refused() {
+        let mut f = files();
+        f.keys("yyl");
+        f.keys("p");
+        assert!(
+            f.app.message.as_deref().unwrap().contains("into itself"),
+            "{:?}",
+            f.app.message
+        );
+        assert!(!f.has("dir1/dir1"));
+    }
+
+    #[test]
+    fn visual_mode_selects_a_range_and_operators_act_on_it() {
+        let mut f = files();
+        f.keys("2jv");
+        assert!(f.app.is_visual());
+        f.keys("j");
+        assert_eq!(f.app.visual_range(), Some(2..=3));
+        f.keys("k");
+        f.keys("jj");
+        assert_eq!(f.app.visual_range(), Some(2..=4));
+        f.keys("d");
+        assert!(!f.app.is_visual());
+        assert!(!f.has("a.txt") && !f.has("b.txt") && !f.has("c.txt") && f.has("dir1"));
+    }
+
+    #[test]
+    fn visual_yank_and_escape_and_leaving_the_level() {
+        let mut f = files();
+        f.keys("v");
+        let response = f.keys("<esc>");
+        assert!(!f.app.is_visual());
+        assert_eq!(
+            response.exit, None,
+            "escape leaves visual instead of quitting"
+        );
+        f.keys("2jvjy");
+        assert!(f.has("a.txt") && f.has("b.txt"));
+        assert!(!f.app.is_visual());
+        f.keys("ggv");
+        f.keys("l");
+        assert!(!f.app.is_visual(), "entering a directory ends visual mode");
+        f.keys("v");
+        f.keys("v");
+        assert!(!f.app.is_visual(), "v toggles");
+    }
+
+    #[test]
+    fn space_selects_entries_across_motions_and_operators_take_the_selection() {
+        let mut f = files();
+        f.keys("2j<space><space>");
+        assert_eq!(f.app.selection().len(), 2);
+        assert_eq!(f.app.tree().location(), f.p("c.txt"), "space moves down");
+        f.keys("gg");
+        f.keys("dd");
+        assert!(!f.has("a.txt") && !f.has("b.txt") && f.has("c.txt") && f.has("dir1"));
+        assert!(f.app.selection().is_empty(), "the selection is used up");
+    }
+
+    #[test]
+    fn a_selection_can_be_yanked_and_pasted_elsewhere() {
+        let mut f = files();
+        f.keys("2j<space><space>yy");
+        f.keys("ggjl");
+        f.keys("p");
+        assert!(f.has("dir2/a.txt") && f.has("dir2/b.txt"));
+    }
+
+    #[test]
+    fn rename_prompt_starts_with_the_name_and_moves_the_cursor_to_the_result() {
+        let mut f = files();
+        f.keys("2jr");
+        assert_eq!(f.app.prompt_view().unwrap().text, "a.txt");
+        assert_eq!(f.app.prompt_view().unwrap().label, "rename: ");
+        f.keys("<c-u>zebra.txt<cr>");
+        assert!(!f.has("a.txt"));
+        assert_eq!(f.read("zebra.txt"), "content of a.txt");
+        assert_eq!(f.app.tree().location(), f.p("zebra.txt"));
+        f.keys("u");
+        assert!(f.has("a.txt") && !f.has("zebra.txt"));
+    }
+
+    #[test]
+    fn cw_and_cc_also_rename() {
+        let mut f = files();
+        f.keys("2jcw<c-u>x.txt<cr>");
+        assert!(f.has("x.txt"));
+        f.keys("cc<c-u>y.txt<cr>");
+        assert!(f.has("y.txt") && !f.has("x.txt"));
+    }
+
+    #[test]
+    fn rename_refuses_clashes_paths_and_empty_names_and_leaves_files_alone() {
+        let mut f = files();
+        f.keys("2jr<c-u>b.txt<cr>");
+        assert_eq!(f.app.message.as_deref(), Some("b.txt already exists"));
+        assert_eq!(f.read("b.txt"), "content of b.txt");
+        f.keys("r<c-u>sub/x<cr>");
+        assert_eq!(f.app.message.as_deref(), Some("names cannot contain /"));
+        f.keys("r<c-u>..<cr>");
+        assert_eq!(f.app.message.as_deref(), Some(".. is not a usable name"));
+        f.keys("r<c-u><cr>");
+        assert_eq!(f.app.message.as_deref(), Some("the name is empty"));
+        f.keys("r<cr>");
+        assert!(f.has("a.txt"), "confirming the unchanged name does nothing");
+        f.keys("r<esc>");
+        assert!(f.app.prompt_view().is_none());
+    }
+
+    #[test]
+    fn new_creates_files_and_folders_in_the_current_directory() {
+        let mut f = files();
+        f.keys("onotes.md<cr>");
+        assert!(f.p("notes.md").is_file());
+        assert_eq!(f.app.tree().location(), f.p("notes.md"));
+        f.keys("oscratch/<cr>");
+        assert!(f.p("scratch").is_dir());
+        f.keys("onotes.md<cr>");
+        assert_eq!(f.app.message.as_deref(), Some("notes.md already exists"));
+        assert_eq!(
+            f.read("notes.md"),
+            "",
+            "an existing file is never truncated"
+        );
+        f.keys("u");
+        assert!(!f.has("scratch"));
+    }
+
+    #[test]
+    fn ex_commands_create_change_modes_and_undo() {
+        let mut f = files();
+        f.keys(":mkdir made<cr>");
+        f.keys(":touch note<cr>");
+        assert!(f.p("made").is_dir() && f.p("note").is_file());
+        f.keys("G");
+        f.keys(":chmod 600<cr>");
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::mode(&fs::metadata(f.p("note")).unwrap()) & 0o777,
+            0o600
+        );
+        f.keys(":undo<cr>");
+        assert_ne!(
+            std::os::unix::fs::MetadataExt::mode(&fs::metadata(f.p("note")).unwrap()) & 0o777,
+            0o600
+        );
+        f.keys(":redo<cr>");
+        f.keys(":mkdir<cr>");
+        assert_eq!(f.app.message.as_deref(), Some("mkdir needs a name"));
+    }
+
+    #[test]
+    fn a_file_operation_that_fails_says_what_and_how_far_it_got() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), "x").unwrap();
+        let mut app = App::new(root.path().to_path_buf(), Keymap::default());
+        app.settle();
+        keys(&mut app, "dd");
+        let message = app.message.clone().unwrap();
+        assert!(message.contains("the trash is not available"), "{message}");
+        assert!(message.ends_with("(0 of 1 done)"), "{message}");
+        assert!(root.path().join("a.txt").exists());
+    }
+
+    #[test]
+    fn only_one_job_runs_at_a_time_and_esc_cancels_it() {
+        let mut f = files();
+        f.app.press(Key::parse_seq("d").unwrap()[0]);
+        f.app.press(Key::parse_seq("d").unwrap()[0]);
+        assert!(f.app.running().is_some());
+        f.app.press(Key::parse_seq("j").unwrap()[0]);
+        f.app.press(Key::parse_seq("d").unwrap()[0]);
+        f.app.press(Key::parse_seq("d").unwrap()[0]);
+        assert!(
+            f.app
+                .message
+                .as_deref()
+                .unwrap()
+                .starts_with("busy: deleting"),
+            "{:?}",
+            f.app.message
+        );
+        let quit = f.app.press(Key::parse_seq("q").unwrap()[0]);
+        assert_eq!(quit.exit, None, "quitting waits for the job");
+        assert!(
+            f.app
+                .message
+                .as_deref()
+                .unwrap()
+                .starts_with("still deleting")
+        );
+        f.app.press(Key::parse_seq("<esc>").unwrap()[0]);
+        assert_eq!(f.app.message.as_deref(), Some("cancelling…"));
+        f.app.settle();
+        assert!(f.app.running().is_none());
+        assert!(
+            f.app.message.as_deref().unwrap().starts_with("cancelled"),
+            "{:?}",
+            f.app.message
+        );
+        assert!(f.has("dir1"), "the cancelled job did nothing");
+    }
+
+    #[test]
+    fn deleting_the_last_entries_leaves_a_valid_cursor() {
+        let mut f = files();
+        f.keys("G");
+        f.keys("2dk");
+        assert_eq!(f.names(), ["dir1", "dir2"]);
+        assert!(f.app.tree().focused().selected().is_some());
+        f.keys("gg2dd");
+        assert!(f.names().is_empty());
+        f.keys("dd");
+        assert_eq!(f.app.message.as_deref(), Some("nothing here"));
+    }
+
+    #[test]
+    fn nothing_selected_means_nothing_to_paste_rename_or_change() {
+        let mut f = files();
+        f.keys("p");
+        assert_eq!(f.app.message.as_deref(), Some("nothing to paste"));
+        f.keys("5dd");
+        f.keys("r");
+        assert_eq!(f.app.message.as_deref(), Some("nothing to rename"));
+        f.keys(":chmod 644<cr>");
+        assert_eq!(f.app.message.as_deref(), Some("nothing to change"));
     }
 }

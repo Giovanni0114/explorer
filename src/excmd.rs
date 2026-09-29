@@ -11,6 +11,12 @@ pub enum Ex {
     /// `Some` sets dotfile visibility, `None` toggles it.
     SetHidden(Option<bool>),
     Marks,
+    Mkdir(String),
+    Touch(String),
+    /// Permission bits from an octal argument.
+    Chmod(u32),
+    Undo,
+    Redo,
 }
 
 /// Parses one command line. `cwd` resolves relative paths and `home` expands a leading `~`.
@@ -25,6 +31,15 @@ pub fn parse(line: &str, cwd: &Path, home: Option<&Path>) -> Result<Ex, String> 
         "h" | "help" => Ok(Ex::Help),
         "cd" => Ok(Ex::Cd(resolve(arg, cwd, home))),
         "marks" => Ok(Ex::Marks),
+        "undo" => Ok(Ex::Undo),
+        "redo" => Ok(Ex::Redo),
+        "mkdir" if !arg.is_empty() => Ok(Ex::Mkdir(arg.to_string())),
+        "touch" if !arg.is_empty() => Ok(Ex::Touch(arg.to_string())),
+        "mkdir" | "touch" => Err(format!("{name} needs a name")),
+        "chmod" => match u32::from_str_radix(arg, 8) {
+            Ok(mode) if mode <= 0o7777 => Ok(Ex::Chmod(mode)),
+            _ => Err("chmod needs an octal mode such as 644 or 755".into()),
+        },
         "set" => match arg {
             "hidden" => Ok(Ex::SetHidden(Some(true))),
             "nohidden" => Ok(Ex::SetHidden(Some(false))),
@@ -86,6 +101,20 @@ mod tests {
         assert_eq!(p("set wrap"), Err("unknown option: wrap".into()));
         assert!(p("set").is_err());
         assert_eq!(p("marks"), Ok(Ex::Marks));
+    }
+
+    #[test]
+    fn file_commands_take_names_and_modes() {
+        assert_eq!(p("mkdir new dir"), Ok(Ex::Mkdir("new dir".into())));
+        assert_eq!(p("touch a.txt"), Ok(Ex::Touch("a.txt".into())));
+        assert!(p("mkdir").is_err());
+        assert!(p("touch   ").is_err());
+        assert_eq!(p("chmod 644"), Ok(Ex::Chmod(0o644)));
+        assert_eq!(p("chmod 4755"), Ok(Ex::Chmod(0o4755)));
+        assert!(p("chmod 999").is_err());
+        assert!(p("chmod rwx").is_err());
+        assert!(p("chmod 77777").is_err());
+        assert_eq!((p("undo"), p("redo")), (Ok(Ex::Undo), Ok(Ex::Redo)));
     }
 
     #[test]

@@ -27,10 +27,13 @@ use ratatui::{
 use crate::{
     actions::{self, Opener},
     app::{App, Exit},
+    clipboard,
     config::Config,
+    fileops::Job,
     fsread,
     keys::Key,
     model::{Effect, Entry, LoadRequest, PreviewRequest},
+    ops::{self, Outcome},
     preview::{self, Content},
     render,
 };
@@ -45,6 +48,8 @@ enum Msg {
     Input(Event),
     Loaded(PathBuf, io::Result<Vec<Entry>>),
     Previewed(PreviewRequest, io::Result<Content>),
+    JobProgress(u64, u64, u64),
+    JobDone(u64, Outcome),
     FsChange(Vec<PathBuf>),
 }
 
@@ -54,6 +59,7 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
     spawn_input(tx.clone(), Arc::clone(&gate));
     let loader = spawn_loaders(tx.clone());
     let previewer = spawn_previewers(tx.clone());
+    let worker = spawn_job_worker(tx.clone(), app.trasher());
     let mut watcher = DirWatcher::new(tx);
     let mut dirty: HashSet<PathBuf> = HashSet::new();
     let mut flush_at: Option<Instant> = None;
@@ -67,6 +73,9 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
         }
         for request in app.tree_mut().take_requests() {
             let _ = loader.send(request);
+        }
+        for job in app.take_jobs() {
+            let _ = worker.send(job);
         }
         for request in app.tree_mut().take_preview_requests() {
             let _ = previewer.send(request);
@@ -100,13 +109,21 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
                     if let Some(exit) = response.exit {
                         return Ok(exit);
                     }
-                    if let Some(Effect::Open(path)) = response.effect {
-                        open(terminal, &gate, config, app, &path);
+                    match response.effect {
+                        Some(Effect::Open(path)) => open(terminal, &gate, config, app, &path),
+                        Some(Effect::Clipboard { paths, cut }) => {
+                            if let Err(e) = clipboard::copy_to_system(&paths, cut) {
+                                app.message = Some(format!("not on the desktop clipboard: {e}"));
+                            }
+                        }
+                        None => {}
                     }
                 }
                 Msg::Input(_) => {}
                 Msg::Loaded(dir, result) => app.finish_load(&dir, result),
                 Msg::Previewed(request, result) => app.tree_mut().finish_preview(&request, result),
+                Msg::JobProgress(id, done, total) => app.job_progress(id, done, total),
+                Msg::JobDone(id, outcome) => app.finish_job(id, outcome),
                 Msg::FsChange(paths) => {
                     for path in paths {
                         for candidate in [Some(path.as_path()), path.parent()].into_iter().flatten()
@@ -219,6 +236,44 @@ fn spawn_loaders(msgs: Sender<Msg>) -> Sender<LoadRequest> {
             }
         });
     }
+    tx
+}
+
+/// Runs file operations one job at a time so the interface never waits on them.
+fn spawn_job_worker(msgs: Sender<Msg>, trash: Arc<dyn ops::Trasher>) -> Sender<Job> {
+    let (tx, rx) = mpsc::channel::<Job>();
+    thread::spawn(move || {
+        for job in rx {
+            let total_bytes = ops::total_bytes(&job.ops);
+            let total_ops = job.ops.len() as u64;
+            let bytes = std::sync::atomic::AtomicU64::new(0);
+            let last = Mutex::new(Instant::now());
+            let report = |done: u64, total: u64| {
+                let mut last = last.lock().unwrap();
+                if last.elapsed() >= Duration::from_millis(50) {
+                    *last = Instant::now();
+                    let _ = msgs.send(Msg::JobProgress(job.id, done, total));
+                }
+            };
+            let progress = |n: u64| {
+                let done = bytes.fetch_add(n, Ordering::Relaxed) + n;
+                report(done, total_bytes);
+            };
+            let ctx = ops::Ctx {
+                trash: &*trash,
+                cancel: &job.cancel,
+                progress: &progress,
+            };
+            let outcome = ops::run_job(&job.ops, &ctx, |finished| {
+                if total_bytes == 0 {
+                    let _ = msgs.send(Msg::JobProgress(job.id, finished as u64, total_ops));
+                }
+            });
+            if msgs.send(Msg::JobDone(job.id, outcome)).is_err() {
+                return;
+            }
+        }
+    });
     tx
 }
 

@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::{ffi::OsString, path::PathBuf};
 
 use ratatui::crossterm::event::KeyCode;
 
@@ -8,6 +8,8 @@ use crate::{keys::Key, lineedit::LineEditor};
 pub enum PromptKind {
     Search,
     Ex,
+    Rename,
+    New,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,13 +29,17 @@ pub struct Prompt {
     pub editor: LineEditor,
     /// Entry the cursor was on when a search opened, so cancelling can go back to it.
     pub origin: Option<OsString>,
+    /// The entry a rename applies to.
+    pub subject: Option<PathBuf>,
 }
 
 impl Prompt {
-    pub fn prefix(&self) -> char {
+    pub fn label(&self) -> &'static str {
         match self.kind {
-            PromptKind::Search => '/',
-            PromptKind::Ex => ':',
+            PromptKind::Search => "/",
+            PromptKind::Ex => ":",
+            PromptKind::Rename => "rename: ",
+            PromptKind::New => "new (end with / for a folder): ",
         }
     }
 
@@ -77,6 +83,7 @@ mod tests {
             kind: PromptKind::Search,
             editor: LineEditor::default(),
             origin: None,
+            subject: None,
         }
     }
 
