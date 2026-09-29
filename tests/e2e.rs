@@ -610,3 +610,30 @@ fn sigterm_restores_the_terminal_and_exits() {
 fn libc_sigterm() -> i32 {
     15
 }
+
+fn click(s: &mut Session, col: u16, row: u16) {
+    s.send(&format!(
+        "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+        col + 1,
+        row + 1,
+        col + 1,
+        row + 1
+    ));
+}
+
+#[test]
+fn clicking_and_scrolling_with_the_mouse() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    let rows = s.wait_for_text("apps/");
+    let row = rows.iter().position(|r| r.contains("zeta/")).unwrap() as u16;
+    let col = rows[row as usize].find("zeta/").unwrap() as u16;
+    click(&mut s, col, row);
+    s.wait("zeta selected", |r| center(r).contains("zeta/"));
+    let row = Session::CENTER as u16;
+    s.send(&format!("\x1b[<65;{};{}M", col + 1, row + 1));
+    s.wait("wheel moved down", |r| center(r).contains("README.md"));
+    click(&mut s, col, row);
+    click(&mut s, col, row);
+    s.wait_for_text(":w save");
+}

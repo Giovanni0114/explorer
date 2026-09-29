@@ -19,6 +19,7 @@ use ratatui::{
     DefaultTerminal,
     crossterm::{
         event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+        event::{DisableMouseCapture, EnableMouseCapture},
         execute,
         terminal::{EnterAlternateScreen, enable_raw_mode},
     },
@@ -26,7 +27,7 @@ use ratatui::{
 
 use crate::{
     actions::{self, Opener},
-    app::{App, Exit},
+    app::{App, Exit, MouseAction},
     clipboard,
     config::Config,
     fileops::Job,
@@ -128,7 +129,7 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
                         && key.code == KeyCode::Char('z')
                         && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    suspend(terminal, &gate)?;
+                    suspend(terminal, &gate, config.mouse)?;
                 }
                 Msg::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     let response = app.press(Key::from_event(key));
@@ -143,6 +144,26 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
                             }
                         }
                         None => {}
+                    }
+                }
+                Msg::Input(Event::Mouse(mouse)) => {
+                    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+                    let action = match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            Some(app.classify_click(mouse.column, mouse.row, Instant::now()))
+                        }
+                        MouseEventKind::ScrollUp => Some(MouseAction::ScrollUp),
+                        MouseEventKind::ScrollDown => Some(MouseAction::ScrollDown),
+                        _ => None,
+                    };
+                    if let Some(action) = action {
+                        let response = app.mouse(action, mouse.column, mouse.row);
+                        if let Some(exit) = response.exit {
+                            return Ok(exit);
+                        }
+                        if let Some(Effect::Open(path)) = response.effect {
+                            open(terminal, &gate, config, app, &path);
+                        }
                     }
                 }
                 Msg::Input(_) => {}
@@ -199,12 +220,16 @@ fn open(
 }
 
 /// Ctrl-Z: gives the terminal back to the shell and stops, like any job, until `fg` resumes it.
-fn suspend(terminal: &mut DefaultTerminal, gate: &InputGate) -> io::Result<()> {
+fn suspend(terminal: &mut DefaultTerminal, gate: &InputGate, mouse: bool) -> io::Result<()> {
     gate.pause();
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     let _ = signal_hook::low_level::raise(signal_hook::consts::SIGTSTP);
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
+    if mouse {
+        execute!(io::stdout(), EnableMouseCapture)?;
+    }
     gate.resume();
     terminal.clear()
 }

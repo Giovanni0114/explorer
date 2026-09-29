@@ -68,6 +68,35 @@ pub struct OverlayView<'a> {
     pub scroll: usize,
 }
 
+/// What a screen column shows, so a click can be mapped back to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnKind {
+    Level(usize),
+    /// The file preview or the editor.
+    Content,
+}
+
+/// Where the last frame put things. Filled in by the renderer.
+#[derive(Debug, Clone, Default)]
+pub struct HitMap {
+    pub columns: Vec<(ColumnKind, u16, u16)>,
+    /// Screen row of the shared cursor row.
+    pub center_row: u16,
+    /// Screen rows the columns occupy, end exclusive.
+    pub rows: std::ops::Range<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseAction {
+    Click,
+    DoubleClick,
+    ScrollUp,
+    ScrollDown,
+}
+
+const WHEEL_STEP: isize = 3;
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// Startup choices that are not key bindings.
 pub struct Settings {
     pub show_hidden: bool,
@@ -119,6 +148,8 @@ pub struct App {
     tree_width: u8,
     painter: Painter,
     depth: crate::theme::Depth,
+    hitmap: std::cell::RefCell<HitMap>,
+    last_click: Option<(std::time::Instant, u16, u16)>,
     /// Rows available to the tree, for page-sized motions.
     viewport: u16,
     home: Option<PathBuf>,
@@ -147,6 +178,8 @@ impl App {
             tree_width: settings.tree_width,
             painter: settings.painter,
             depth: settings.depth,
+            hitmap: std::cell::RefCell::default(),
+            last_click: None,
             viewport: 24,
             home: std::env::var_os("HOME").map(PathBuf::from),
             message: None,
@@ -169,6 +202,108 @@ impl App {
         self.viewport = rows;
         if let Mode::Edit(editor) = &mut self.mode {
             editor.set_rows(usize::from(rows));
+        }
+    }
+
+    pub fn set_hitmap(&self, map: HitMap) {
+        *self.hitmap.borrow_mut() = map;
+    }
+
+    /// Turns a raw button press into a click or a double click on the same cell.
+    pub fn classify_click(&mut self, col: u16, row: u16, now: std::time::Instant) -> MouseAction {
+        let double = self.last_click.is_some_and(|(at, c, r)| {
+            c == col && r == row && now.duration_since(at) <= DOUBLE_CLICK
+        });
+        self.last_click = if double { None } else { Some((now, col, row)) };
+        if double {
+            MouseAction::DoubleClick
+        } else {
+            MouseAction::Click
+        }
+    }
+
+    /// Handles the mouse at a screen cell. Prompts and questions ignore it so nothing happens by accident.
+    pub fn mouse(&mut self, action: MouseAction, col: u16, row: u16) -> Response {
+        self.message = None;
+        let wheel = match action {
+            MouseAction::ScrollUp => Some(-WHEEL_STEP),
+            MouseAction::ScrollDown => Some(WHEEL_STEP),
+            _ => None,
+        };
+        match &mut self.mode {
+            Mode::Edit(editor) => {
+                if let Some(delta) = wheel {
+                    let key = if delta < 0 {
+                        KeyCode::Up
+                    } else {
+                        KeyCode::Down
+                    };
+                    for _ in 0..WHEEL_STEP {
+                        editor.press(Key::plain(key));
+                    }
+                }
+                return Response::default();
+            }
+            Mode::Overlay { lines, scroll, .. } => {
+                if let Some(delta) = wheel {
+                    *scroll = scroll
+                        .saturating_add_signed(delta)
+                        .min(lines.len().saturating_sub(1));
+                }
+                return Response::default();
+            }
+            Mode::Prompt(_) | Mode::Conflict { .. } => return Response::default(),
+            Mode::Normal | Mode::Visual { .. } => {}
+        }
+        if action == MouseAction::DoubleClick {
+            // The first click already slid the list to put its entry on the cursor row, so open that.
+            return self.run(Command::Enter, None, None);
+        }
+        let map = self.hitmap.borrow().clone();
+        if !map.rows.contains(&row) {
+            return Response::default();
+        }
+        let Some(&(kind, _, _)) = map
+            .columns
+            .iter()
+            .find(|(_, x, w)| col >= *x && col < x + w)
+        else {
+            return Response::default();
+        };
+        match (kind, wheel) {
+            (ColumnKind::Content, Some(delta)) => {
+                self.tree.scroll_preview(delta, usize::from(self.viewport));
+                Response::default()
+            }
+            (ColumnKind::Content, None) => Response::default(),
+            (ColumnKind::Level(level), Some(delta)) => {
+                self.mode = Mode::Normal;
+                self.tree.focus_level(level);
+                self.tree.move_by(delta);
+                Response::default()
+            }
+            (ColumnKind::Level(level), None) => {
+                let Some(entries) = self
+                    .tree
+                    .levels()
+                    .get(level)
+                    .map(|l| (l.cursor, l.entries.len()))
+                else {
+                    return Response::default();
+                };
+                let (cursor, len) = entries;
+                let offset = i64::from(row) - i64::from(map.center_row);
+                let Some(index) = usize::try_from(cursor as i64 + offset)
+                    .ok()
+                    .filter(|&i| i < len)
+                else {
+                    return Response::default();
+                };
+                self.mode = Mode::Normal;
+                self.tree.focus_level(level);
+                self.tree.set_cursor(index);
+                Response::default()
+            }
         }
     }
 
@@ -2521,5 +2656,139 @@ mod tests {
         app.set_viewport(20);
         keys(&mut app, "G");
         assert_eq!(app.editor().unwrap().top(), 180);
+    }
+
+    /// Renders once so the app knows where its columns are, as the runtime does before any click.
+    fn draw(app: &App) -> Vec<String> {
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 100, 13));
+        crate::render::render(app, buf.area, &mut buf);
+        (0..13)
+            .map(|y| (0..100).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    fn cell_of(lines: &[String], text: &str) -> (u16, u16) {
+        let row = lines.iter().position(|l| l.contains(text)).unwrap();
+        let byte = lines[row].find(text).unwrap();
+        (lines[row][..byte].chars().count() as u16, row as u16)
+    }
+
+    #[test]
+    fn a_click_selects_the_entry_under_the_pointer() {
+        let tmp = fixture();
+        let mut app = open(tmp.path());
+        let lines = draw(&app);
+        let (x, y) = cell_of(&lines, "notes.txt");
+        app.mouse(MouseAction::Click, x, y);
+        assert_eq!(selected(&app), "notes.txt");
+        let lines = draw(&app);
+        assert_eq!(
+            cell_of(&lines, "notes.txt").1,
+            6,
+            "the list slid so the pick is on the cursor row"
+        );
+    }
+
+    #[test]
+    fn a_click_in_the_child_column_moves_the_focus_there() {
+        let tmp = fixture();
+        let mut app = open(tmp.path());
+        keys(&mut app, "j");
+        let lines = draw(&app);
+        let (x, y) = cell_of(&lines, "main.rs");
+        app.mouse(MouseAction::Click, x, y);
+        assert_eq!(app.tree().focus(), 1);
+        assert_eq!(selected(&app), "main.rs");
+        let lines = draw(&app);
+        let (x, y) = cell_of(&lines, "docs/");
+        app.mouse(MouseAction::Click, x, y);
+        assert_eq!(
+            app.tree().focus(),
+            0,
+            "clicking a parent column goes back to it"
+        );
+        assert_eq!(selected(&app), "docs");
+    }
+
+    #[test]
+    fn a_double_click_opens_like_l() {
+        let tmp = fixture();
+        let mut app = open(tmp.path());
+        let lines = draw(&app);
+        let (x, y) = cell_of(&lines, "src/");
+        let now = std::time::Instant::now();
+        assert_eq!(app.classify_click(x, y, now), MouseAction::Click);
+        app.mouse(MouseAction::Click, x, y);
+        assert_eq!(
+            app.classify_click(x, y, now + std::time::Duration::from_millis(200)),
+            MouseAction::DoubleClick
+        );
+        app.mouse(MouseAction::DoubleClick, x, y);
+        app.settle();
+        assert_eq!(app.tree().current_dir(), tmp.path().join("src"));
+        let later = now + std::time::Duration::from_secs(2);
+        assert_eq!(
+            app.classify_click(x, y, later),
+            MouseAction::Click,
+            "slow clicks stay single"
+        );
+    }
+
+    #[test]
+    fn a_double_click_on_a_file_opens_the_editor() {
+        let tmp = fixture();
+        let mut app = open(tmp.path());
+        let lines = draw(&app);
+        let (x, y) = cell_of(&lines, "README.md");
+        app.mouse(MouseAction::Click, x, y);
+        app.mouse(MouseAction::DoubleClick, x, y);
+        assert!(app.editor().is_some());
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_column_under_the_pointer() {
+        let tmp = fixture();
+        let body: String = (0..100).map(|i| format!("{i}\n")).collect();
+        fs::write(tmp.path().join("notes.txt"), body).unwrap();
+        let mut app = open(tmp.path());
+        let lines = draw(&app);
+        let (x, y) = cell_of(&lines, "docs/");
+        app.mouse(MouseAction::ScrollDown, x, y);
+        assert_eq!(selected(&app), "Cargo.toml", "three entries down");
+        app.mouse(MouseAction::ScrollUp, x, y);
+        assert_eq!(selected(&app), "docs");
+        keys(&mut app, "/notes<cr>");
+        app.settle();
+        let lines = draw(&app);
+        let (px, py) = cell_of(&lines, "1 0");
+        app.mouse(MouseAction::ScrollDown, px + 4, py);
+        assert_eq!(app.tree().preview().unwrap().scroll, 3);
+    }
+
+    #[test]
+    fn clicks_outside_any_entry_and_during_prompts_do_nothing() {
+        let tmp = fixture();
+        let mut app = open(tmp.path());
+        draw(&app);
+        app.mouse(MouseAction::Click, 2, 0);
+        app.mouse(MouseAction::Click, 2, 12);
+        assert_eq!(selected(&app), "docs");
+        keys(&mut app, ":");
+        let lines = draw(&app);
+        let (x, y) = cell_of(&lines, "src/");
+        app.mouse(MouseAction::Click, x, y);
+        assert_eq!(selected(&app), "docs");
+        assert!(app.prompt_view().is_some());
+    }
+
+    #[test]
+    fn the_wheel_moves_the_editor_cursor() {
+        let tmp = fixture();
+        let body: String = (0..50).map(|i| format!("{i}\n")).collect();
+        fs::write(tmp.path().join("notes.txt"), body).unwrap();
+        let mut app = open(tmp.path());
+        keys(&mut app, "/notes<cr>l");
+        app.mouse(MouseAction::ScrollDown, 80, 5);
+        assert_eq!(app.editor().unwrap().cursor().line, 3);
     }
 }

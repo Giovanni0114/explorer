@@ -424,6 +424,16 @@ impl Tree {
         None
     }
 
+    /// Moves the focus to level `level`, one of the levels on screen.
+    pub fn focus_level(&mut self, level: usize) {
+        while self.focus > level {
+            self.leave();
+        }
+        if level == self.focus + 1 && self.levels.len() > level {
+            self.enter();
+        }
+    }
+
     pub fn leave(&mut self) {
         if self.focus > 0 {
             self.focus -= 1;

@@ -65,7 +65,21 @@ fn main() -> io::Result<()> {
     let mut app = App::with_settings(root, keymap, settings);
     app.message = notice;
     let mut terminal = ratatui::init();
+    if config.mouse {
+        ratatui::crossterm::execute!(io::stdout(), ratatui::crossterm::event::EnableMouseCapture)?;
+        // ratatui's own panic hook restores the screen but not mouse reporting, which would keep flooding the shell.
+        let restore_screen = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = ratatui::crossterm::execute!(
+                io::stdout(),
+                ratatui::crossterm::event::DisableMouseCapture
+            );
+            restore_screen(info);
+        }));
+    }
     let result = runtime::run(&mut terminal, &mut app, &config);
+    let _ =
+        ratatui::crossterm::execute!(io::stdout(), ratatui::crossterm::event::DisableMouseCapture);
     ratatui::restore();
     if let (Exit::Quit, Some(file)) = (result?, cli.cwd_file) {
         fs::write(file, app.tree().current_dir().as_os_str().as_bytes())?;

@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, OverlayView},
+    app::{App, ColumnKind, HitMap, OverlayView},
     imageview::Painter,
     layout::{self, Placed},
     model::{Entry, FilePreview, Kind, Level, Load, PreviewState},
@@ -52,6 +52,21 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     let widths: Vec<u16> = levels.iter().map(natural_width).collect();
     let content = editor.is_some() || preview.is_some();
     let placed = layout::place(&widths, content, tree.width, focus, app.tree_width());
+    app.set_hitmap(HitMap {
+        columns: placed
+            .iter()
+            .map(|p| {
+                let kind = if p.level < levels.len() {
+                    ColumnKind::Level(p.level)
+                } else {
+                    ColumnKind::Content
+                };
+                (kind, tree.x + p.x, p.width)
+            })
+            .collect(),
+        center_row: tree.y + center,
+        rows: tree.y..tree.bottom(),
+    });
 
     for p in &placed {
         if p.level >= levels.len() {
