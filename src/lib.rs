@@ -19,4 +19,5 @@ pub mod render;
 pub mod runtime;
 pub mod search;
 pub mod shell;
+pub mod textbuf;
 pub mod theme;

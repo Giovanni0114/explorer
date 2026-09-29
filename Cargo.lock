@@ -2044,6 +2044,7 @@ dependencies = [
  "tempfile",
  "toml",
  "trash",
+ "unicode-segmentation",
  "unicode-width",
  "vt100",
  "zip",
