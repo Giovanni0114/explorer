@@ -2799,6 +2799,9 @@ mod tests {
         let tmp = fixture();
         let mut app = open(tmp.path());
         keys(&mut app, ":images<cr>");
-        assert_eq!(app.message.as_deref(), Some("pictures: quadrant blocks"));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("pictures: quadrant blocks; cell 10x20 px")
+        );
     }
 }

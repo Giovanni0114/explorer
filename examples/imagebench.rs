@@ -40,6 +40,10 @@ fn main() {
     );
     drop(full);
     let screen = (220u16, 55u16);
+    println!(
+        "{}",
+        tx::imageview::Painter::new(tx::imageview::Mode::Sixel, None).describe()
+    );
     for (name, painter) in [
         ("blocks", tx::imageview::Painter::blocks()),
         (

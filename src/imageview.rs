@@ -221,11 +221,8 @@ impl Painter {
     /// `answers` are what the terminal said when asked at startup, if it was asked.
     pub fn new(mode: Mode, answers: Option<&Answers>) -> Painter {
         let (method, reason) = choose(mode, answers, |name| std::env::var(name).ok());
-        let font = answers
-            .and_then(|a| a.cell)
-            .map(|(w, h)| FontSize::new(w, h))
-            .unwrap_or_else(cell_size);
-        Painter::build(method, font, reason)
+        let (w, h) = plausible_cell(&[answers.and_then(|a| a.cell), cell_size()]);
+        Painter::build(method, FontSize::new(w, h), reason)
     }
 
     /// Quadrant blocks, without asking the terminal anything. For tests and pipes.
@@ -279,7 +276,10 @@ impl Painter {
 
     /// How pictures are drawn and why, in a sentence for the footer.
     pub fn describe(&self) -> String {
-        format!("pictures: {}", self.reason)
+        format!(
+            "pictures: {}; cell {}x{} px",
+            self.reason, self.font.width, self.font.height
+        )
     }
 
     /// Whether images are drawn with escape sequences that text drawn over them may not erase.
@@ -531,13 +531,22 @@ fn encode_blocks(image: &DynamicImage, size: Size, kind: BlockKind) -> Vec<Block
 }
 
 /// Pixel size of one terminal cell, from the size the terminal reports for its window.
-fn cell_size() -> FontSize {
-    match ratatui::crossterm::terminal::window_size() {
-        Ok(w) if w.width > 0 && w.height > 0 && w.columns > 0 && w.rows > 0 => {
-            FontSize::new((w.width / w.columns).max(1), (w.height / w.rows).max(1))
-        }
-        _ => FontSize::new(10, 20),
-    }
+fn cell_size() -> Option<(u16, u16)> {
+    let w = ratatui::crossterm::terminal::window_size().ok()?;
+    (w.columns > 0 && w.rows > 0).then(|| (w.width / w.columns, w.height / w.rows))
+}
+
+const DEFAULT_CELL: (u16, u16) = (10, 20);
+
+/// The first cell size that looks like a real font. Some terminals report pixel sizes that make a
+/// cell a few pixels tall, which would shrink pictures to a blur.
+fn plausible_cell(candidates: &[Option<(u16, u16)>]) -> (u16, u16) {
+    candidates
+        .iter()
+        .flatten()
+        .copied()
+        .find(|&(w, h)| (4..=200).contains(&w) && (8..=400).contains(&h))
+        .unwrap_or(DEFAULT_CELL)
 }
 
 #[cfg(test)]
@@ -853,7 +862,27 @@ mod tests {
         );
         assert!(painter.take_drawn().is_none());
         assert!(!painter.enabled());
-        assert_eq!(painter.describe(), "pictures: off");
+        assert!(
+            painter.describe().starts_with("pictures: off"),
+            "{}",
+            painter.describe()
+        );
+    }
+
+    #[test]
+    fn implausible_cell_sizes_are_ignored() {
+        assert_eq!(
+            plausible_cell(&[Some((9, 18)), Some((2, 6))]),
+            (9, 18),
+            "the terminal's own answer wins"
+        );
+        assert_eq!(
+            plausible_cell(&[None, Some((2, 6))]),
+            DEFAULT_CELL,
+            "a cell 6 px tall is not a font"
+        );
+        assert_eq!(plausible_cell(&[Some((0, 0)), Some((8, 17))]), (8, 17));
+        assert_eq!(plausible_cell(&[None, None]), DEFAULT_CELL);
     }
 
     #[test]

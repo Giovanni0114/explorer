@@ -56,7 +56,12 @@ fn main() -> io::Result<()> {
     };
     let mut terminal = ratatui::init();
     // Asked in raw mode and before the input thread starts, so the answers are not taken for keys.
-    let answers = if images == ImageMode::Auto {
+    // Graphics modes set in the config are asked too, for the cell size that pictures are sized by.
+    let asks = !matches!(
+        images,
+        ImageMode::Off | ImageMode::Blocks | ImageMode::Halfblocks
+    );
+    let answers = if asks {
         let in_tmux = std::env::var_os("TMUX").is_some();
         termquery::ask(in_tmux, std::time::Duration::from_millis(500)).ok()
     } else {
