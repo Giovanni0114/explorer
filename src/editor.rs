@@ -313,9 +313,6 @@ pub struct Editor {
     disk_key: PreviewKey,
     tab_text: &'static str,
     highlight: Option<HighlightCache>,
-    highlight_open: Option<Vec<HighlightChange>>,
-    highlight_done: Vec<Vec<HighlightChange>>,
-    highlight_undone: Vec<Vec<HighlightChange>>,
     /// One-line notice for the footer, cleared by the next key.
     pub message: Option<String>,
 }
@@ -325,10 +322,46 @@ struct HighlightCache {
     lines: Vec<Line>,
 }
 
-struct HighlightChange {
-    start: usize,
-    before: Vec<Line>,
-    after: Vec<Line>,
+impl HighlightCache {
+    fn patch_replace(&mut self, buf: &Buffer, start: Pos, end: Pos, text: &str) {
+        self.lines.truncate(HIGHLIGHT_LINES);
+        if start.line >= self.lines.len() {
+            return;
+        }
+
+        if start.line == end.line && !text.contains('\n') {
+            let line = &mut self.lines[start.line];
+            if line_has_text(line, buf.line(start.line)) {
+                patch_line(line, start.col, end.col, text);
+            }
+            return;
+        }
+
+        let old_end = end.line.saturating_add(1);
+        let affected_is_current = old_end <= self.lines.len()
+            && self.lines[start.line..old_end]
+                .iter()
+                .enumerate()
+                .all(|(offset, line)| line_has_text(line, buf.line(start.line + offset)));
+        let inserted = text.matches('\n').count() + 1;
+        let room = HIGHLIGHT_LINES - start.line;
+        let replacement = if affected_is_current {
+            patch_lines(&self.lines[start.line..old_end], start, end, text, room)
+        } else {
+            std::iter::repeat_with(Line::default)
+                .take(inserted.min(room))
+                .collect()
+        };
+
+        if inserted >= room {
+            self.lines.truncate(start.line);
+            self.lines.extend(replacement);
+        } else {
+            let cached_end = old_end.min(self.lines.len());
+            self.lines.splice(start.line..cached_end, replacement);
+            self.lines.truncate(HIGHLIGHT_LINES);
+        }
+    }
 }
 
 impl Editor {
@@ -359,9 +392,6 @@ impl Editor {
                 "    "
             },
             highlight: None,
-            highlight_open: None,
-            highlight_done: Vec::new(),
-            highlight_undone: Vec::new(),
             message: None,
         })
     }
@@ -441,7 +471,7 @@ impl Editor {
         let text = self.buf.line(index);
         if let Some(highlight) = &self.highlight
             && let Some(line) = highlight.lines.get(index)
-            && line.text() == text
+            && line_has_text(line, text)
         {
             return line.clone();
         }
@@ -477,87 +507,17 @@ impl Editor {
         });
     }
 
-    /// Makes a one-line edit look styled immediately, while leaving the cache stale for Syntect.
+    /// Makes an edit look styled immediately, while leaving the cache stale for Syntect.
     fn replace(&mut self, start: Pos, end: Pos, text: &str) -> Pos {
         let (start, end) = if start <= end {
             (start, end)
         } else {
             (end, start)
         };
-        self.patch_highlight(start, end, text);
+        if let Some(highlight) = &mut self.highlight {
+            highlight.patch_replace(&self.buf, start, end, text);
+        }
         self.buf.replace(start, end, text)
-    }
-
-    fn patch_highlight(&mut self, start: Pos, end: Pos, text: &str) {
-        let old = self.buf.line(start.line);
-        let Some(highlight) = &mut self.highlight else {
-            return;
-        };
-        let old_end = end.line.saturating_add(1);
-        if start.line >= highlight.lines.len() || old_end > highlight.lines.len() {
-            return;
-        }
-        let before = highlight.lines[start.line..old_end].to_vec();
-        let inserted = text.matches('\n').count() + 1;
-        if start.line == end.line && !text.contains('\n') {
-            let line = &mut highlight.lines[start.line];
-            if line.text() != old {
-                return;
-            }
-            patch_line(line, start.col, end.col, text);
-        } else {
-            highlight.lines.splice(
-                start.line..old_end,
-                std::iter::repeat_with(Line::default).take(inserted),
-            );
-        }
-        let after = highlight.lines[start.line..start.line + inserted].to_vec();
-        if let Some(open) = &mut self.highlight_open {
-            open.push(HighlightChange {
-                start: start.line,
-                before,
-                after,
-            });
-        }
-    }
-
-    fn begin_highlight_group(&mut self) {
-        self.end_highlight_group();
-        self.buf.begin_group(self.cursor);
-        self.highlight_open = Some(Vec::new());
-    }
-
-    fn end_highlight_group(&mut self) {
-        let changed = self.buf.has_open_changes();
-        self.buf.end_group();
-        if let Some(changes) = self.highlight_open.take()
-            && changed
-        {
-            self.highlight_done.push(changes);
-            self.highlight_undone.clear();
-        }
-    }
-
-    fn restore_highlight_changes(&mut self, changes: &[HighlightChange], undo: bool) {
-        let Some(highlight) = &mut self.highlight else {
-            return;
-        };
-        let changes: Box<dyn Iterator<Item = &HighlightChange>> = if undo {
-            Box::new(changes.iter().rev())
-        } else {
-            Box::new(changes.iter())
-        };
-        for change in changes {
-            let (from, to) = if undo {
-                (&change.after, &change.before)
-            } else {
-                (&change.before, &change.after)
-            };
-            let end = change.start + from.len();
-            if end <= highlight.lines.len() {
-                highlight.lines.splice(change.start..end, to.clone());
-            }
-        }
     }
 
     /// Takes the text of the file again after `:e!`, keeping the cursor where it can stay.
@@ -567,9 +527,6 @@ impl Editor {
         self.buf = buf;
         self.disk_key = disk_key;
         self.highlight = None;
-        self.highlight_open = None;
-        self.highlight_done.clear();
-        self.highlight_undone.clear();
         self.mode = Mode::Normal;
         self.input.reset();
         self.cursor = self.buf.clamp(self.cursor, false);
@@ -630,10 +587,10 @@ impl Editor {
                 count,
                 arg,
             } => {
-                self.begin_highlight_group();
+                self.buf.begin_group(self.cursor);
                 let event = self.run(command, count, arg);
                 if !self.is_insert() {
-                    self.end_highlight_group();
+                    self.buf.end_group();
                 }
                 event
             }
@@ -642,10 +599,10 @@ impl Editor {
                 motion,
                 count,
             } => {
-                self.begin_highlight_group();
+                self.buf.begin_group(self.cursor);
                 self.operate(operator, motion, count);
                 if !self.is_insert() {
-                    self.end_highlight_group();
+                    self.buf.end_group();
                 }
                 None
             }
@@ -732,27 +689,21 @@ impl Editor {
     }
 
     fn undo(&mut self) -> Option<Pos> {
-        self.highlight_open = None;
-        let cursor = self.buf.undo()?;
-        let Some(changes) = self.highlight_done.pop() else {
-            self.highlight = None;
-            return Some(cursor);
-        };
-        self.restore_highlight_changes(&changes, true);
-        self.highlight_undone.push(changes);
-        Some(cursor)
+        let highlight = &mut self.highlight;
+        self.buf.undo_with(|buf, start, end, text| {
+            if let Some(highlight) = highlight {
+                highlight.patch_replace(buf, start, end, text);
+            }
+        })
     }
 
     fn redo(&mut self) -> Option<Pos> {
-        self.highlight_open = None;
-        let cursor = self.buf.redo()?;
-        let Some(changes) = self.highlight_undone.pop() else {
-            self.highlight = None;
-            return Some(cursor);
-        };
-        self.restore_highlight_changes(&changes, false);
-        self.highlight_done.push(changes);
-        Some(cursor)
+        let highlight = &mut self.highlight;
+        self.buf.redo_with(|buf, start, end, text| {
+            if let Some(highlight) = highlight {
+                highlight.patch_replace(buf, start, end, text);
+            }
+        })
     }
 
     /// The selection as its first and last position, inclusive, and whether it is whole lines.
@@ -808,10 +759,10 @@ impl Editor {
             arg,
         } = self.input.feed(key, &self.visual_keymap, true)
         {
-            self.begin_highlight_group();
+            self.buf.begin_group(self.cursor);
             self.run_visual(command, count, arg);
             if !self.is_insert() {
-                self.end_highlight_group();
+                self.buf.end_group();
             }
         }
     }
@@ -1470,12 +1421,41 @@ impl Editor {
     }
 
     fn leave_insert(&mut self) {
-        self.end_highlight_group();
+        self.buf.end_group();
         self.mode = Mode::Normal;
         self.cursor.col = self.cursor.col.saturating_sub(1);
         self.cursor = self.buf.clamp(self.cursor, false);
         self.want_col = self.cursor.col;
     }
+}
+
+#[derive(Clone, Copy)]
+struct SpanStyle {
+    color: preview::Rgb,
+    bold: bool,
+    italic: bool,
+}
+
+impl SpanStyle {
+    fn span(self, text: impl Into<String>) -> preview::Span {
+        preview::Span {
+            text: text.into(),
+            color: self.color,
+            bold: self.bold,
+            italic: self.italic,
+        }
+    }
+}
+
+fn line_has_text(line: &Line, text: &str) -> bool {
+    let mut rest = text;
+    for span in &line.0 {
+        let Some(after) = rest.strip_prefix(&span.text) else {
+            return false;
+        };
+        rest = after;
+    }
+    rest.is_empty()
 }
 
 fn patch_line(line: &mut Line, start: usize, end: usize, text: &str) {
@@ -1484,31 +1464,64 @@ fn patch_line(line: &mut Line, start: usize, end: usize, text: &str) {
     } else {
         style_at(line, start.saturating_sub(1)).or_else(|| style_at(line, start))
     }
-    .unwrap_or(preview::Span {
-        text: String::new(),
+    .unwrap_or(SpanStyle {
         color: crate::theme::FG,
         bold: false,
         italic: false,
     });
     let mut spans = spans_in_range(line, 0, start);
     if !text.is_empty() {
-        spans.push(preview::Span {
-            text: text.to_string(),
-            color: inherited.color,
-            bold: inherited.bold,
-            italic: inherited.italic,
-        });
+        spans.push(inherited.span(text));
     }
     spans.extend(spans_in_range(line, end, usize::MAX));
     line.0 = coalesce_spans(spans);
 }
 
-fn style_at(line: &Line, col: usize) -> Option<preview::Span> {
+fn patch_lines(affected: &[Line], start: Pos, end: Pos, text: &str, limit: usize) -> Vec<Line> {
+    let first = &affected[0];
+    let last = affected.last().unwrap_or(first);
+    let inherited = if start < end {
+        style_at(first, start.col)
+    } else {
+        style_at(first, start.col.saturating_sub(1)).or_else(|| style_at(first, start.col))
+    }
+    .unwrap_or(SpanStyle {
+        color: crate::theme::FG,
+        bold: false,
+        italic: false,
+    });
+    let prefix = spans_in_range(first, 0, start.col);
+    let suffix = spans_in_range(last, end.col, usize::MAX);
+    let count = text.matches('\n').count() + 1;
+    let mut lines = Vec::with_capacity(count.min(limit));
+
+    for (index, part) in text.split('\n').take(limit).enumerate() {
+        let mut spans = if index == 0 {
+            prefix.clone()
+        } else {
+            Vec::new()
+        };
+        if !part.is_empty() {
+            spans.push(inherited.span(part));
+        }
+        if index + 1 == count {
+            spans.extend(suffix.clone());
+        }
+        lines.push(Line(coalesce_spans(spans)));
+    }
+    lines
+}
+
+fn style_at(line: &Line, col: usize) -> Option<SpanStyle> {
     let mut start = 0;
     for span in &line.0 {
         let end = start + grapheme_len(&span.text);
         if col < end {
-            return Some(span.clone());
+            return Some(SpanStyle {
+                color: span.color,
+                bold: span.bold,
+                italic: span.italic,
+            });
         }
         start = end;
     }
@@ -2347,6 +2360,38 @@ mod tests {
         assert!(e.highlight_stale());
     }
 
+    #[test]
+    fn undo_and_redo_patch_a_cache_refreshed_after_the_edit() {
+        let mut e = Editor::open(
+            "a.rs".into(),
+            b"fn one() {}\nfn two() {}\nfn three() {}\n",
+            (0, None),
+        )
+        .unwrap();
+        e.refresh_highlight();
+        keys(&mut e, "J");
+        e.refresh_highlight();
+
+        keys(&mut e, "u");
+        assert_eq!(e.styled_line(1).text(), "fn two() {}");
+        assert!(e.styled_line(1).0.len() > 1);
+
+        keys(&mut e, "<c-r>");
+        assert_eq!(e.styled_line(1).text(), "fn three() {}");
+        assert!(e.styled_line(1).0.len() > 1);
+    }
+
+    #[test]
+    fn provisional_highlight_never_grows_past_its_line_limit() {
+        let mut e = Editor::open("a.rs".into(), b"fn main() {}\n", (0, None)).unwrap();
+        e.refresh_highlight();
+        keys(&mut e, "i");
+
+        e.insert(&"\n".repeat(HIGHLIGHT_LINES + 10));
+
+        assert!(e.highlight.as_ref().unwrap().lines.len() <= HIGHLIGHT_LINES);
+    }
+
     /// Feeds thousands of random keys and checks that nothing panics and the cursor stays on the text.
     #[test]
     fn random_key_storms_never_panic_or_strand_the_cursor() {
@@ -2374,9 +2419,13 @@ mod tests {
             let mut rng = Rng(seed);
             let mut e = ed(ORIGINAL);
             e.set_rows(6);
-            for _ in 0..400 {
+            e.refresh_highlight();
+            for step in 0..400 {
                 let key = KEYS[rng.next(KEYS.len())];
                 keys(&mut e, key);
+                if step % 17 == 0 {
+                    e.refresh_highlight();
+                }
                 let c = e.cursor();
                 assert!(c.line < e.line_count(), "seed {seed} after {key}");
                 let len = grapheme_len(e.line_text(c.line));
@@ -2394,10 +2443,11 @@ mod tests {
                     "seed {seed} after {key}"
                 );
                 assert!(String::from_utf8(e.bytes()).is_ok());
+                assert!(e.highlight.as_ref().unwrap().lines.len() <= HIGHLIGHT_LINES);
             }
             keys(&mut e, "<esc>");
             let mut undone = 0;
-            while e.buf.undo().is_some() {
+            while e.undo().is_some() {
                 undone += 1;
                 assert!(undone < 100_000);
             }

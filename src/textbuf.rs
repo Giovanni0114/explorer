@@ -318,9 +318,23 @@ impl Buffer {
     }
 
     pub fn undo(&mut self) -> Option<Pos> {
+        self.undo_with(|_, _, _, _| {})
+    }
+
+    /// Undoes one group, reporting each replacement immediately before applying it.
+    pub(crate) fn undo_with(
+        &mut self,
+        mut before_replace: impl FnMut(&Buffer, Pos, Pos, &str),
+    ) -> Option<Pos> {
         self.end_group();
         let group = self.history.done.pop()?;
         for edit in group.edits.iter().rev() {
+            before_replace(
+                self,
+                self.to_pos(edit.at),
+                self.to_pos(edit.inserted_end()),
+                &edit.removed,
+            );
             self.unapply(edit);
         }
         let cursor = group.before;
@@ -329,10 +343,24 @@ impl Buffer {
     }
 
     pub fn redo(&mut self) -> Option<Pos> {
+        self.redo_with(|_, _, _, _| {})
+    }
+
+    /// Redoes one group, reporting each replacement immediately before applying it.
+    pub(crate) fn redo_with(
+        &mut self,
+        mut before_replace: impl FnMut(&Buffer, Pos, Pos, &str),
+    ) -> Option<Pos> {
         self.end_group();
         let group = self.history.undone.pop()?;
         let mut cursor = group.before;
         for (i, edit) in group.edits.iter().enumerate() {
+            before_replace(
+                self,
+                self.to_pos(edit.at),
+                self.to_pos(edit.removed_end()),
+                &edit.inserted,
+            );
             self.apply(edit);
             if i == 0 {
                 cursor = self.to_pos(edit.at);
@@ -566,6 +594,54 @@ mod tests {
         assert!(b.redo().is_some());
         assert_eq!(b.redo(), None);
         assert_eq!(b.lines(), ["ALPHA!", ""]);
+    }
+
+    #[test]
+    fn undo_and_redo_report_each_replacement_before_applying_it() {
+        let mut b = buf("alpha\nbeta\n");
+        b.begin_group(Pos::default());
+        b.replace(Pos::new(0, 0), Pos::new(0, 5), "ALPHA");
+        b.replace(Pos::new(0, 5), Pos::new(0, 5), "!");
+        b.end_group();
+
+        let mut undo = Vec::new();
+        b.undo_with(|buf, start, end, text| {
+            undo.push((buf.line(0).to_string(), start, end, text.to_string()));
+        });
+        assert_eq!(
+            undo,
+            [
+                (
+                    "ALPHA!".into(),
+                    Pos::new(0, 5),
+                    Pos::new(0, 6),
+                    String::new()
+                ),
+                (
+                    "ALPHA".into(),
+                    Pos::new(0, 0),
+                    Pos::new(0, 5),
+                    "alpha".into()
+                )
+            ]
+        );
+
+        let mut redo = Vec::new();
+        b.redo_with(|buf, start, end, text| {
+            redo.push((buf.line(0).to_string(), start, end, text.to_string()));
+        });
+        assert_eq!(
+            redo,
+            [
+                (
+                    "alpha".into(),
+                    Pos::new(0, 0),
+                    Pos::new(0, 5),
+                    "ALPHA".into()
+                ),
+                ("ALPHA".into(), Pos::new(0, 5), Pos::new(0, 5), "!".into())
+            ]
+        );
     }
 
     #[test]
