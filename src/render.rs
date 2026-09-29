@@ -51,7 +51,18 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     let preview = app.tree().preview().filter(|_| editor.is_none());
     let widths: Vec<u16> = levels.iter().map(natural_width).collect();
     let content = editor.is_some() || preview.is_some();
-    let placed = layout::place(&widths, content, tree.width, focus, app.tree_width());
+    // Always three columns: the parent, the focused level and what is under the cursor.
+    let first = focus.saturating_sub(1);
+    let mut placed = layout::place(
+        &widths[first..],
+        content,
+        tree.width,
+        focus - first,
+        app.tree_width(),
+    );
+    for p in &mut placed {
+        p.level += first;
+    }
     app.set_hitmap(HitMap {
         columns: placed
             .iter()
