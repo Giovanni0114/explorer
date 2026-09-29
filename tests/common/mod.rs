@@ -91,6 +91,11 @@ impl Session {
         }
     }
 
+    /// The home directory the app runs with, where its trash lives.
+    pub fn home(&self) -> &Path {
+        self._home.path()
+    }
+
     pub fn send(&mut self, bytes: &str) {
         self.writer.write_all(bytes.as_bytes()).unwrap();
         self.writer.flush().unwrap();
@@ -183,3 +188,4 @@ pub fn fixture() -> tempfile::TempDir {
 pub const ENTER: &str = "\r";
 pub const ESC: &str = "\x1b";
 pub const CTRL_C: &str = "\x03";
+pub const CTRL_U: &str = "\x15";

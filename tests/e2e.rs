@@ -2,6 +2,11 @@ mod common;
 
 use common::*;
 
+/// Everything but the header and footer lines.
+fn tree_rows(rows: &[String]) -> &[String] {
+    &rows[1..rows.len() - 1]
+}
+
 fn center(rows: &[String]) -> &str {
     &rows[Session::CENTER]
 }
@@ -286,4 +291,161 @@ fn ctrl_o_returns_to_where_a_jump_started() {
     s.wait("back on apps", |r| center(r).contains("apps/"));
     s.send("\t");
     s.wait("forward on README", |r| center(r).contains("README.md"));
+}
+
+fn trash_files(s: &Session) -> std::path::PathBuf {
+    s.home().join(".local/share/Trash/files")
+}
+
+#[test]
+fn dd_moves_a_file_to_the_real_trash_and_u_brings_it_back() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("G");
+    s.wait("on README", |r| center(r).contains("README.md"));
+    s.send("dd");
+    s.wait("gone from the listing", |r| {
+        !tree_rows(r).iter().any(|x| x.contains("README.md"))
+    });
+    assert!(!tmp.path().join("README.md").exists());
+    assert!(
+        trash_files(&s).join("README.md").exists(),
+        "it is in the freedesktop trash"
+    );
+    let rows = s.wait_for_text("moved README.md to the trash");
+    assert!(
+        rows.last().unwrap().contains("u undoes it"),
+        "{:?}",
+        rows.last()
+    );
+    s.send("u");
+    s.wait("back in the listing", |r| {
+        tree_rows(r).iter().any(|x| x.contains("README.md"))
+    });
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+        "# readme\n"
+    );
+    assert!(!trash_files(&s).join("README.md").exists());
+}
+
+#[test]
+fn yank_and_paste_copy_a_file_into_another_directory() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("Gyy");
+    s.wait_for_text("yanked README.md");
+    s.send("gglp");
+    s.wait_for_text("pasted README.md");
+    assert!(tmp.path().join("apps/README.md").is_file());
+    assert!(tmp.path().join("README.md").is_file());
+    let rows = s.wait("cursor on the copy", |r| center(r).contains("README.md"));
+    assert!(center(&rows).contains("README.md"));
+}
+
+#[test]
+fn a_paste_that_clashes_asks_and_keep_both_numbers_the_copy() {
+    let tmp = fixture();
+    std::fs::write(tmp.path().join("apps/README.md"), "other").unwrap();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("Gyygglp");
+    let rows = s.wait_for_text("README.md exists");
+    assert!(
+        rows.last().unwrap().contains("[k]eep both"),
+        "{:?}",
+        rows.last()
+    );
+    s.send("k");
+    s.wait_for_text("pasted README.md");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("apps/README.md")).unwrap(),
+        "other"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("apps/README (1).md")).unwrap(),
+        "# readme\n"
+    );
+}
+
+#[test]
+fn cut_and_paste_move_a_directory() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("2jxx");
+    s.wait_for_text("cut zeta");
+    s.send("gglp");
+    s.wait_for_text("moved zeta");
+    assert!(tmp.path().join("apps/zeta").is_dir());
+    assert!(!tmp.path().join("zeta").exists());
+}
+
+#[test]
+fn rename_and_new_prompts_edit_the_file_system_and_the_view() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("G");
+    s.wait("on README", |r| center(r).contains("README.md"));
+    s.send("r");
+    s.wait_for_text("rename: README.md");
+    s.send(&format!("{CTRL_U}NOTES.md{ENTER}"));
+    s.wait_for_text("renamed to NOTES.md");
+    assert!(tmp.path().join("NOTES.md").exists() && !tmp.path().join("README.md").exists());
+    s.wait("cursor follows the rename", |r| {
+        center(r).contains("NOTES.md")
+    });
+    s.send("onew-dir/\r");
+    s.wait_for_text("created new-dir/");
+    assert!(tmp.path().join("new-dir").is_dir());
+    s.wait("cursor on the new folder", |r| {
+        center(r).contains("new-dir/")
+    });
+}
+
+#[test]
+fn visual_mode_deletes_a_range_and_escape_leaves_it() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send("v");
+    s.wait_for_text("-- VISUAL --");
+    s.send(ESC);
+    s.wait("visual gone", |r| {
+        !r.iter().any(|x| x.contains("-- VISUAL --"))
+    });
+    s.send("vjd");
+    s.wait("two folders gone", |r| {
+        !r.iter().any(|x| x.contains("apps/")) && !r.iter().any(|x| x.contains("notes/"))
+    });
+    assert!(!tmp.path().join("apps").exists() && !tmp.path().join("notes").exists());
+    assert!(tmp.path().join("zeta").exists());
+    s.send("u");
+    s.wait_for_text("apps/");
+    assert!(
+        tmp.path().join("apps/web/index.html").exists(),
+        "the whole tree came back"
+    );
+}
+
+#[test]
+fn a_selection_made_with_space_survives_moving_around() {
+    let tmp = fixture();
+    let mut s = Session::spawn(tmp.path());
+    s.wait_for_text("apps/");
+    s.send(" ");
+    s.wait("marker appears", |r| r.iter().any(|x| x.starts_with('●')));
+    s.send("jj");
+    s.wait("marker stays", |r| {
+        r.iter().any(|x| x.starts_with('●') && x.contains("apps/"))
+    });
+    s.send("dd");
+    s.wait("selected entry deleted", |r| {
+        !r.iter().any(|x| x.contains("apps/"))
+    });
+    assert!(!tmp.path().join("apps").exists());
+    assert!(tmp.path().join("zeta").exists(), "only the selection went");
 }

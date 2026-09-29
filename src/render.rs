@@ -897,4 +897,116 @@ mod tests {
             "{lines:#?}"
         );
     }
+
+    fn plain_files() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for f in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            fs::write(tmp.path().join(f), f).unwrap();
+        }
+        tmp
+    }
+
+    fn row_of(lines: &[String], text: &str) -> usize {
+        lines.iter().position(|l| l.contains(text)).unwrap()
+    }
+
+    #[test]
+    fn selected_entries_carry_a_marker_and_others_do_not() {
+        let tmp = plain_files();
+        let mut app = open(tmp.path());
+        keys(&mut app, "<space><space>");
+        let (lines, _) = rows(&app, 80, 15);
+        assert!(
+            lines[row_of(&lines, "a.txt")].starts_with('●'),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[row_of(&lines, "b.txt")].starts_with('●'),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[row_of(&lines, "c.txt")].starts_with(' '),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn visual_mode_tints_the_covered_rows_and_says_so_in_the_footer() {
+        let tmp = plain_files();
+        let mut app = open(tmp.path());
+        keys(&mut app, "vj");
+        let (lines, buf) = rows(&app, 80, 15);
+        let (a, b, c) = (
+            row_of(&lines, "a.txt") as u16,
+            row_of(&lines, "b.txt") as u16,
+            row_of(&lines, "c.txt") as u16,
+        );
+        assert_ne!(buf[(5, a)].bg, theme::rgb(BG), "anchor row is tinted");
+        assert_ne!(buf[(5, b)].bg, theme::rgb(BG), "cursor row is filled");
+        assert_ne!(
+            buf[(5, a)].bg,
+            buf[(5, b)].bg,
+            "the cursor row is stronger than the range"
+        );
+        assert_eq!(
+            buf[(5, c)].bg,
+            theme::rgb(BG),
+            "rows outside the range are untouched"
+        );
+        assert!(
+            footer(&lines).starts_with("-- VISUAL --"),
+            "{:?}",
+            footer(&lines)
+        );
+    }
+
+    #[test]
+    fn a_waiting_paste_asks_its_question_in_the_footer() {
+        let tmp = plain_files();
+        fs::create_dir(tmp.path().join("dir")).unwrap();
+        fs::write(tmp.path().join("dir/a.txt"), "old").unwrap();
+        let mut app = open(tmp.path());
+        keys(&mut app, "jyygglp");
+        let (lines, _) = rows(&app, 100, 15);
+        assert!(
+            footer(&lines).starts_with("a.txt exists: [s]kip [o]verwrite [k]eep both"),
+            "{:?}",
+            footer(&lines)
+        );
+    }
+
+    #[test]
+    fn a_running_job_shows_in_the_footer_with_its_cancel_hint() {
+        let tmp = plain_files();
+        let mut app = open(tmp.path());
+        for key in Key::parse_seq("dd").unwrap() {
+            app.press(key);
+        }
+        let (lines, _) = rows(&app, 100, 15);
+        assert_eq!(footer(&lines), "deleting a.txt…  (Esc cancels)");
+        let id = app.take_jobs()[0].id;
+        app.job_progress(id, 30, 120);
+        let (lines, _) = rows(&app, 100, 15);
+        assert_eq!(footer(&lines), "deleting a.txt… 25%  (Esc cancels)");
+    }
+
+    #[test]
+    fn the_rename_prompt_shows_its_label_and_puts_the_cursor_after_the_name() {
+        let tmp = plain_files();
+        let mut app = open(tmp.path());
+        keys(&mut app, "r");
+        let (lines, buf) = rows(&app, 80, 15);
+        assert_eq!(footer(&lines), "rename: a.txt");
+        assert!(
+            buf[(1 + 8 + 5, 14)].modifier.contains(Modifier::REVERSED),
+            "cursor is past the end of the name"
+        );
+        keys(&mut app, "<esc>o");
+        let (lines, _) = rows(&app, 80, 15);
+        assert!(
+            footer(&lines).starts_with("new (end with / for a folder):"),
+            "{:?}",
+            footer(&lines)
+        );
+    }
 }

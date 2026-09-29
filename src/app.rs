@@ -667,11 +667,15 @@ impl App {
                     Op::Copy { to, .. } | Op::Move { to, .. } => Some(to.clone()),
                     _ => None,
                 });
-                let pasted = ops
+                let sources: Vec<PathBuf> = ops
                     .iter()
-                    .filter(|op| matches!(op, Op::Copy { .. } | Op::Move { .. }))
-                    .count();
-                let what = format!("{pasted} item{}", if pasted == 1 { "" } else { "s" });
+                    .filter_map(|op| match op {
+                        Op::Copy { from, .. } | Op::Move { from, .. } => Some(from.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let pasted = sources.len();
+                let what = noun(&sources);
                 if pasted == 0 {
                     self.message = Some("nothing to paste here".into());
                     return;
