@@ -725,6 +725,11 @@ impl<C: Cmd> InputState<C> {
         }
     }
 
+    /// Whether an operator such as `d` is waiting for its motion.
+    pub fn has_operator(&self) -> bool {
+        self.operator.is_some()
+    }
+
     pub fn is_pending(&self) -> bool {
         self.count.is_some()
             || !self.keys.is_empty()

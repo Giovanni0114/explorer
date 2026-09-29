@@ -301,6 +301,283 @@ pub fn range_for(buf: &Buffer, cursor: Pos, target: Target, word_motion: bool) -
     }
 }
 
+/// The range of a vim text object such as `iw`, `a"`, `i(` or `ap` around `c`, or `None` when the cursor is in none.
+pub fn text_object(buf: &Buffer, c: Pos, ch: char, around: bool, count: usize) -> Option<Range> {
+    let count = count.max(1);
+    match ch {
+        'w' | 'W' => word_object(buf, c, ch == 'W', around, count),
+        '"' | '\'' | '`' => quote_object(buf, c, ch, around),
+        'p' => paragraph_object(buf, c, around, count),
+        _ => {
+            let (open, close) = match ch {
+                '(' | ')' | 'b' => ('(', ')'),
+                '[' | ']' => ('[', ']'),
+                '{' | '}' | 'B' => ('{', '}'),
+                '<' | '>' => ('<', '>'),
+                _ => return None,
+            };
+            bracket_object(buf, c, (open, close), around, count)
+        }
+    }
+}
+
+fn word_object(buf: &Buffer, c: Pos, big: bool, around: bool, count: usize) -> Option<Range> {
+    let len = buf.line_len(c.line);
+    if c.col >= len {
+        return None;
+    }
+    let class = |col: usize| class_at(buf, Pos::new(c.line, col), big);
+    let run_start = |mut col: usize| {
+        while col > 0 && class(col - 1) == class(col) {
+            col -= 1;
+        }
+        col
+    };
+    // One past the last character of the run at `col`.
+    let run_end = |mut col: usize| {
+        while col + 1 < len && class(col + 1) == class(col) {
+            col += 1;
+        }
+        col + 1
+    };
+    let mut start = run_start(c.col);
+    let mut end = run_end(c.col);
+    if !around {
+        for _ in 1..count {
+            if end >= len {
+                break;
+            }
+            end = run_end(end);
+        }
+    } else {
+        let mut unit = 0;
+        loop {
+            if class(end - 1) == 0 {
+                // Started on blanks, so the word after them belongs to it.
+                if end < len {
+                    end = run_end(end);
+                }
+            } else if end < len && class(end) == 0 {
+                end = run_end(end);
+            } else if unit == 0 && start > 0 && class(start - 1) == 0 {
+                // No blanks after the word, so take the ones before it.
+                start = run_start(start - 1);
+            }
+            unit += 1;
+            if unit >= count || end >= len {
+                break;
+            }
+            end = run_end(end);
+        }
+    }
+    Some(Range {
+        start: Pos::new(c.line, start),
+        end: Pos::new(c.line, end),
+        linewise: false,
+    })
+}
+
+fn quote_object(buf: &Buffer, c: Pos, quote: char, around: bool) -> Option<Range> {
+    let graphemes: Vec<&str> = buf.line(c.line).graphemes(true).collect();
+    let mut wanted = [0u8; 4];
+    let wanted = quote.encode_utf8(&mut wanted) as &str;
+    let quotes: Vec<usize> = (0..graphemes.len())
+        .filter(|&i| graphemes[i] == wanted && (i == 0 || graphemes[i - 1] != "\\"))
+        .collect();
+    let (open, close) = quotes
+        .chunks_exact(2)
+        .map(|pair| (pair[0], pair[1]))
+        .find(|&(_, close)| close >= c.col)?;
+    let blank = |i: usize| graphemes[i].chars().all(char::is_whitespace);
+    let (mut start, mut end) = if around {
+        (open, close + 1)
+    } else {
+        (open + 1, close)
+    };
+    if around {
+        if end < graphemes.len() && blank(end) {
+            while end < graphemes.len() && blank(end) {
+                end += 1;
+            }
+        } else {
+            while start > 0 && blank(start - 1) {
+                start -= 1;
+            }
+        }
+    }
+    Some(Range {
+        start: Pos::new(c.line, start),
+        end: Pos::new(c.line, end),
+        linewise: false,
+    })
+}
+
+fn char_at(buf: &Buffer, p: Pos) -> Option<char> {
+    crate::textbuf::grapheme_at(buf.line(p.line), p.col)?.chars().next()
+}
+
+fn step_back(buf: &Buffer, mut p: Pos) -> Option<Pos> {
+    loop {
+        if p.col > 0 {
+            return Some(Pos::new(p.line, p.col - 1));
+        }
+        if p.line == 0 {
+            return None;
+        }
+        p = Pos::new(p.line - 1, buf.line_len(p.line - 1));
+    }
+}
+
+fn step_forward(buf: &Buffer, mut p: Pos) -> Option<Pos> {
+    loop {
+        if p.col + 1 < buf.line_len(p.line) {
+            return Some(Pos::new(p.line, p.col + 1));
+        }
+        if p.line + 1 >= buf.line_count() {
+            return None;
+        }
+        p = Pos::new(p.line + 1, 0);
+        if buf.line_len(p.line) > 0 {
+            return Some(p);
+        }
+    }
+}
+
+/// The nearest `open` before `from` that has no `close` after it, skipping balanced pairs.
+fn unmatched_before(buf: &Buffer, from: Pos, (open, close): (char, char)) -> Option<Pos> {
+    let (mut p, mut depth) = (from, 0);
+    while let Some(prev) = step_back(buf, p) {
+        p = prev;
+        match char_at(buf, p) {
+            Some(c) if c == close => depth += 1,
+            Some(c) if c == open && depth == 0 => return Some(p),
+            Some(c) if c == open => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn unmatched_after(buf: &Buffer, from: Pos, (open, close): (char, char)) -> Option<Pos> {
+    let (mut p, mut depth) = (from, 0);
+    while let Some(next) = step_forward(buf, p) {
+        p = next;
+        match char_at(buf, p) {
+            Some(c) if c == open => depth += 1,
+            Some(c) if c == close && depth == 0 => return Some(p),
+            Some(c) if c == close => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn bracket_object(
+    buf: &Buffer,
+    c: Pos,
+    pair: (char, char),
+    around: bool,
+    count: usize,
+) -> Option<Range> {
+    let mut open = if char_at(buf, c) == Some(pair.0) {
+        c
+    } else {
+        unmatched_before(buf, c, pair)?
+    };
+    for _ in 1..count {
+        open = unmatched_before(buf, open, pair)?;
+    }
+    let close = unmatched_after(buf, open, pair)?;
+    if around {
+        return Some(Range {
+            start: open,
+            end: Pos::new(close.line, close.col + 1),
+            linewise: false,
+        });
+    }
+    let open_ends_line = open.col + 1 >= buf.line_len(open.line);
+    let start = if open_ends_line {
+        Pos::new(open.line + 1, 0)
+    } else {
+        Pos::new(open.line, open.col + 1)
+    };
+    let close_leads_line = buf
+        .line(close.line)
+        .graphemes(true)
+        .take(close.col)
+        .all(|g| g.chars().all(char::is_whitespace));
+    if open_ends_line && close_leads_line && close.line > open.line + 1 {
+        let last = close.line - 1;
+        return Some(Range {
+            start,
+            end: Pos::new(last, buf.line_len(last)),
+            linewise: true,
+        });
+    }
+    if start > close {
+        // `()` or a block with nothing in it.
+        return Some(Range {
+            start: close,
+            end: close,
+            linewise: false,
+        });
+    }
+    Some(Range {
+        start,
+        end: close,
+        linewise: false,
+    })
+}
+
+fn paragraph_object(buf: &Buffer, c: Pos, around: bool, count: usize) -> Option<Range> {
+    let n = buf.line_count();
+    let blank = |l: usize| buf.line_len(l) == 0;
+    let run_end = |l: usize| {
+        let mut e = l;
+        while e + 1 < n && blank(e + 1) == blank(l) {
+            e += 1;
+        }
+        e
+    };
+    let on_blank = blank(c.line);
+    let mut start = c.line;
+    while start > 0 && blank(start - 1) == on_blank {
+        start -= 1;
+    }
+    let mut end = run_end(c.line);
+    if !around {
+        for _ in 1..count {
+            if end + 1 >= n {
+                break;
+            }
+            end = run_end(end + 1);
+        }
+    } else {
+        let mut unit = 0;
+        loop {
+            if end + 1 < n {
+                end = run_end(end + 1);
+            } else if unit == 0 && !on_blank && start > 0 {
+                // No blank lines after the paragraph, so take the ones before it.
+                start -= 1;
+                while start > 0 && blank(start - 1) {
+                    start -= 1;
+                }
+            }
+            unit += 1;
+            if unit >= count || end + 1 >= n {
+                break;
+            }
+            end = run_end(end + 1);
+        }
+    }
+    Some(Range {
+        start: Pos::new(start, 0),
+        end: Pos::new(end, buf.line_len(end)),
+        linewise: true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
