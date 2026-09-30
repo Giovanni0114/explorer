@@ -204,6 +204,9 @@ impl EncodeJob {
     }
 }
 
+/// How much of each side of the room a sixel picture fills over a slow link: about a third of the bytes.
+const REMOTE_SIXEL_SHARE: f64 = 0.6;
+
 /// Encoded pictures kept, so going back to one is instant.
 const ENCODED_CACHE: usize = 12;
 
@@ -220,6 +223,8 @@ pub struct Painter {
     method: Method,
     picker: Option<Picker>,
     font: FontSize,
+    /// Share of the room a picture fills, below one when a slow link makes every pixel cost.
+    shrink: f64,
     reason: String,
     cache: RefCell<std::collections::VecDeque<(Key, Arc<Encoded>)>>,
     requested: RefCell<std::collections::HashSet<Key>>,
@@ -264,6 +269,10 @@ impl Painter {
             let font = FontSize::new((self.font.width / 2).max(1), (self.font.height / 2).max(1));
             self.picker = Painter::picker(ProtocolType::Kitty, font);
         }
+        // Sixel pixels cannot be stretched by the terminal, so the picture itself has to be smaller.
+        if remote && self.method == Method::Graphics(ProtocolType::Sixel) {
+            self.shrink = REMOTE_SIXEL_SHARE;
+        }
         self
     }
 
@@ -290,6 +299,7 @@ impl Painter {
             method,
             picker,
             font,
+            shrink: 1.0,
             reason,
             cache: RefCell::default(),
             requested: RefCell::default(),
@@ -328,7 +338,8 @@ impl Painter {
         let (fw, fh) = (f64::from(self.font.width), f64::from(self.font.height));
         let scale = (f64::from(available.width) * fw / w)
             .min(f64::from(available.height) * fh / h)
-            .min(2.0);
+            .min(2.0)
+            * self.shrink;
         let cols = ((w * scale / fw).round() as u16).clamp(1, available.width);
         let rows = ((h * scale / fh).round() as u16).clamp(1, available.height);
         Some(Size::new(cols, rows))
@@ -414,10 +425,10 @@ impl Painter {
         match self.method {
             Method::Graphics(_) => {
                 let font = self.encoded_font();
-                (
-                    u32::from(columns) * u32::from(font.width),
-                    u32::from(rows) * u32::from(font.height),
-                )
+                let px = |cells: u16, cell: u16| {
+                    (f64::from(cells) * f64::from(cell) * self.shrink) as u32
+                };
+                (px(columns, font.width), px(rows, font.height))
             }
             // Two pixels a cell each way, and twice that so the smoothing filter has something to average.
             Method::Blocks(_) | Method::Off => (u32::from(columns) * 4, u32::from(rows) * 4),
@@ -1074,10 +1085,10 @@ mod tests {
             "the layout keeps the real cell size"
         );
         let sixel = graphics(ProtocolType::Sixel).remote(true);
-        assert_eq!(
-            sixel.decode_target(100, 50),
-            (1000, 1000),
-            "sixel cannot be stretched"
-        );
+        assert_eq!(sixel.decode_target(100, 50), (600, 600), "sixel is drawn smaller");
+        let fitted = sixel
+            .fitted_size(&picture(1000, 1000), Size::new(100, 50))
+            .unwrap();
+        assert_eq!(fitted, Size::new(60, 30), "60% of the room, in cells");
     }
 }
