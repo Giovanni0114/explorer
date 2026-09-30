@@ -51,9 +51,31 @@ fn main() {
             "sixel",
             tx::imageview::Painter::new(tx::imageview::Mode::Sixel, None),
         ),
+        (
+            "kitty",
+            tx::imageview::Painter::new(tx::imageview::Mode::Kitty, None),
+        ),
+        (
+            "iterm2",
+            tx::imageview::Painter::new(tx::imageview::Mode::Iterm2, None),
+        ),
     ] {
         let (w, h) = painter.decode_target(screen.0 / 2, screen.1 - 2);
         tx::preview::set_image_target(w, h);
+        // What a photo's own header preview costs, for the first paint.
+        let t = Instant::now();
+        match tx::preview::build_quick(&path) {
+            Some(content) => {
+                let quick = content.image.unwrap();
+                println!(
+                    "{name}: first paint from the file header: {:?} ({}x{})",
+                    t.elapsed(),
+                    quick.0.width(),
+                    quick.0.height()
+                );
+            }
+            None => println!("{name}: no header preview needed for the first paint"),
+        }
         let t = Instant::now();
         let content = tx::preview::build(&path).unwrap();
         let image = content.image.unwrap();

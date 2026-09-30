@@ -83,6 +83,10 @@ pub enum EditCommand {
     SwapEnds,
     Lowercase,
     Uppercase,
+    /// `i` after an operator or in a selection: the inside of a text object.
+    Inner,
+    /// `a` after an operator or in a selection: a text object with its surroundings.
+    Around,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +140,8 @@ impl Cmd for EditCommand {
                 | HalfUp
                 | PageDown
                 | PageUp
+                | Inner
+                | Around
         )
     }
 
@@ -143,7 +149,7 @@ impl Cmd for EditCommand {
         use EditCommand::*;
         matches!(
             self,
-            FindChar | FindCharBack | TillChar | TillCharBack | ReplaceChar
+            FindChar | FindCharBack | TillChar | TillCharBack | ReplaceChar | Inner | Around
         )
     }
 }
@@ -229,6 +235,12 @@ const VISUAL_KEYS: &[(&str, EditCommand)] = &[
     ("s", EditCommand::Change),
 ];
 
+/// `i` and `a` start a text object where an operator or a selection waits for one.
+const OBJECT_KEYS: &[(&str, EditCommand)] = &[
+    ("i", EditCommand::Inner),
+    ("a", EditCommand::Around),
+];
+
 fn build_keymap(tables: &[&[(&str, EditCommand)]]) -> Keymap<EditCommand> {
     let bindings = tables
         .iter()
@@ -303,6 +315,7 @@ pub struct Editor {
     input: InputState<EditCommand>,
     keymap: Keymap<EditCommand>,
     visual_keymap: Keymap<EditCommand>,
+    object_keymap: Keymap<EditCommand>,
     register: Option<Register>,
     last_find: Option<Find>,
     last_search: Option<String>,
@@ -378,7 +391,8 @@ impl Editor {
             mode: Mode::Normal,
             input: InputState::default(),
             keymap: build_keymap(&[DEFAULT_KEYS]),
-            visual_keymap: build_keymap(&[DEFAULT_KEYS, VISUAL_KEYS]),
+            visual_keymap: build_keymap(&[DEFAULT_KEYS, VISUAL_KEYS, OBJECT_KEYS]),
+            object_keymap: build_keymap(&[DEFAULT_KEYS, OBJECT_KEYS]),
             register: None,
             last_find: None,
             last_search: None,
@@ -581,7 +595,12 @@ impl Editor {
     }
 
     fn press_normal(&mut self, key: Key) -> Option<EditEvent> {
-        match self.input.feed(key, &self.keymap, false) {
+        let keymap = if self.input.has_operator() {
+            &self.object_keymap
+        } else {
+            &self.keymap
+        };
+        match self.input.feed(key, keymap, false) {
             Fed::Run {
                 command,
                 count,
@@ -776,6 +795,30 @@ impl Editor {
             return;
         };
         match command {
+            Inner | Around => {
+                let Some(ch) = arg else { return };
+                let cursor = self.cursor;
+                let object = editmotion::text_object(
+                    &self.buf,
+                    cursor,
+                    ch,
+                    command == Around,
+                    count.unwrap_or(1),
+                );
+                if let Some(object) = object {
+                    // ponytail: replaces the selection instead of growing it like vim's repeated viw/vi(; grow from the selection if that's missed
+                    self.mode = Mode::Visual {
+                        anchor: object.start,
+                        lines: object.linewise,
+                    };
+                    self.cursor = if object.linewise {
+                        Pos::new(object.end.line, 0)
+                    } else {
+                        Pos::new(object.end.line, object.end.col.saturating_sub(1))
+                    };
+                    self.want_col = self.cursor.col;
+                }
+            }
             c if c.is_motion() => self.move_cursor(c, count, arg),
             Visual | VisualLine => {
                 let wanted = command == VisualLine;
@@ -1016,6 +1059,7 @@ impl Editor {
                 }
                 target(at, Kind::Exclusive)
             }
+            Inner | Around => silent(),
             _ => Err("not a motion".into()),
         }
     }
@@ -1054,6 +1098,20 @@ impl Editor {
                     start: Pos::new(cursor.line, 0),
                     end: Pos::new(end, self.buf.line_len(end)),
                     linewise: true,
+                }
+            }
+            Some((command @ (Inner | Around), arg)) => {
+                let Some(ch) = arg else { return };
+                let object = editmotion::text_object(
+                    &self.buf,
+                    cursor,
+                    ch,
+                    command == Around,
+                    count.unwrap_or(1),
+                );
+                match object {
+                    Some(range) => range,
+                    None => return,
                 }
             }
             Some((command, arg)) => {
@@ -2188,6 +2246,97 @@ mod tests {
         let mut e = ed("x\ny\nz\n");
         keys(&mut e, "VGd");
         assert_eq!(text(&e), "", "deleting every line empties the file");
+    }
+
+    #[test]
+    fn word_objects_change_delete_and_select() {
+        let mut e = ed("foo bar baz\n");
+        keys(&mut e, "wciwX<esc>");
+        assert_eq!(text(&e), "foo X baz\n");
+        let mut e = ed("foo bar baz\n");
+        keys(&mut e, "wdaw");
+        assert_eq!(text(&e), "foo baz\n");
+        keys(&mut e, "wdaw");
+        assert_eq!(text(&e), "foo\n", "the last word takes the space before it");
+        let mut e = ed("foo bar baz\n");
+        keys(&mut e, "d2aw");
+        assert_eq!(text(&e), "baz\n");
+        let mut e = ed("foo bar\n");
+        keys(&mut e, "viwd");
+        assert_eq!(text(&e), " bar\n");
+        let mut e = ed("żółw 🎉x\n");
+        keys(&mut e, "ciwa<esc>");
+        assert_eq!(text(&e), "a 🎉x\n");
+    }
+
+    #[test]
+    fn quote_objects_pick_the_pair_around_or_after_the_cursor() {
+        let src = "say \"hi there\" now\n";
+        for moves in ["", "fh", "f\""] {
+            let mut e = ed(src);
+            keys(&mut e, &format!("{moves}di\""));
+            assert_eq!(text(&e), "say \"\" now\n", "after {moves:?}");
+        }
+        let mut e = ed(src);
+        keys(&mut e, "fhda\"");
+        assert_eq!(text(&e), "say now\n");
+        let mut e = ed("no quotes\n");
+        keys(&mut e, "ci\"X<esc>");
+        assert_eq!(text(&e), "no quotes\n");
+        let mut e = ed("a \"b\" c\n");
+        keys(&mut e, "fbvi\"c!<esc>");
+        assert_eq!(text(&e), "a \"!\" c\n");
+    }
+
+    #[test]
+    fn bracket_objects_nest_span_lines_and_take_counts() {
+        let mut e = ed("f(a, (b), c)\n");
+        keys(&mut e, "fbdi(");
+        assert_eq!(text(&e), "f(a, (), c)\n");
+        let mut e = ed("f(a, (b), c)\n");
+        keys(&mut e, "fb2di(");
+        assert_eq!(text(&e), "f()\n");
+        let mut e = ed("f(a, (b), c)\n");
+        keys(&mut e, "fbda(");
+        assert_eq!(text(&e), "f(a, , c)\n");
+        let mut e = ed("f(a, (b), c)\n");
+        keys(&mut e, "fbcibX<esc>");
+        assert_eq!(text(&e), "f(a, (X), c)\n");
+        let mut e = ed("fn x() {\n    a;\n    b;\n}\n");
+        keys(&mut e, "jdi{");
+        assert_eq!(text(&e), "fn x() {\n}\n");
+        let mut e = ed("v[1, 2]\n");
+        keys(&mut e, "f1yi[$p");
+        assert_eq!(text(&e), "v[1, 2]1, 2\n");
+    }
+
+    #[test]
+    fn paragraph_objects_are_linewise() {
+        let mut e = ed("a\nb\n\nc\n");
+        keys(&mut e, "dip");
+        assert_eq!(text(&e), "\nc\n");
+        let mut e = ed("a\nb\n\nc\n");
+        keys(&mut e, "dap");
+        assert_eq!(text(&e), "c\n");
+        let mut e = ed("a\nb\n\nc\n");
+        keys(&mut e, "vipd");
+        assert_eq!(text(&e), "\nc\n");
+    }
+
+    #[test]
+    fn i_and_a_still_insert_and_append_in_normal_mode() {
+        let mut e = ed("abc\n");
+        keys(&mut e, "iX<esc>");
+        assert_eq!(text(&e), "Xabc\n");
+        keys(&mut e, "aY<esc>");
+        assert_eq!(text(&e), "XYabc\n");
+    }
+
+    #[test]
+    fn a_text_object_change_is_one_undo_step() {
+        let mut e = ed("foo bar\n");
+        keys(&mut e, "ciwxyz<esc>u");
+        assert_eq!(text(&e), "foo bar\n");
     }
 
     #[test]

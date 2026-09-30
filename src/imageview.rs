@@ -8,7 +8,7 @@ use crate::termquery::Answers;
 use image::DynamicImage;
 use image::imageops::FilterType;
 use ratatui::{
-    buffer::Buffer,
+    buffer::{Buffer, CellDiffOption},
     layout::{Rect, Size},
     style::Color,
     widgets::Widget,
@@ -168,7 +168,15 @@ pub struct BlockCell {
 
 pub enum Encoded {
     Graphics(Protocol),
-    Blocks { cells: Vec<BlockCell>, size: Size },
+    /// An iTerm2 inline image, sent as a JPEG that the terminal stretches over `size` cells.
+    Jpeg {
+        sequence: String,
+        size: Size,
+    },
+    Blocks {
+        cells: Vec<BlockCell>,
+        size: Size,
+    },
 }
 
 /// Encoding a picture for the terminal, to be done off the main thread.
@@ -196,6 +204,9 @@ impl EncodeJob {
     }
 }
 
+/// How much of each side of the room a sixel picture fills over a slow link: about a third of the bytes.
+const REMOTE_SIXEL_SHARE: f64 = 0.6;
+
 /// Encoded pictures kept, so going back to one is instant.
 const ENCODED_CACHE: usize = 12;
 
@@ -203,7 +214,7 @@ impl Encoded {
     fn size(&self) -> Size {
         match self {
             Encoded::Graphics(protocol) => protocol.size(),
-            Encoded::Blocks { size, .. } => *size,
+            Encoded::Jpeg { size, .. } | Encoded::Blocks { size, .. } => *size,
         }
     }
 }
@@ -212,6 +223,8 @@ pub struct Painter {
     method: Method,
     picker: Option<Picker>,
     font: FontSize,
+    /// Share of the room a picture fills, below one when a slow link makes every pixel cost.
+    shrink: f64,
     reason: String,
     cache: RefCell<std::collections::VecDeque<(Key, Arc<Encoded>)>>,
     requested: RefCell<std::collections::HashSet<Key>>,
@@ -248,22 +261,45 @@ impl Painter {
         Painter::build(Method::Off, FontSize::new(10, 20), "off".into())
     }
 
+    /// Over a slow link the bytes of a picture are what the wait is made of. Kitty takes raw pixels,
+    /// four bytes each, and stretches them over the cells itself, so it is sent at half the
+    /// resolution, a quarter of the bytes.
+    pub fn remote(mut self, remote: bool) -> Painter {
+        if remote && self.method == Method::Graphics(ProtocolType::Kitty) {
+            let font = FontSize::new((self.font.width / 2).max(1), (self.font.height / 2).max(1));
+            self.picker = Painter::picker(ProtocolType::Kitty, font);
+        }
+        // Sixel pixels cannot be stretched by the terminal, so the picture itself has to be smaller.
+        if remote && self.method == Method::Graphics(ProtocolType::Sixel) {
+            self.shrink = REMOTE_SIXEL_SHARE;
+        }
+        self
+    }
+
+    fn picker(protocol: ProtocolType, font: FontSize) -> Option<Picker> {
+        // Deprecated in favour of the library's own terminal query, which leaves a reader
+        // thread behind when the terminal is silent. This program asks by itself instead.
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(font);
+        picker.set_protocol_type(protocol);
+        Some(picker)
+    }
+
+    /// Pixels a cell is encoded with, which is less than it shows when the picture is sent small.
+    fn encoded_font(&self) -> FontSize {
+        self.picker.as_ref().map_or(self.font, Picker::font_size)
+    }
+
     fn build(method: Method, font: FontSize, reason: String) -> Painter {
         let picker = match method {
-            Method::Graphics(protocol) => {
-                // Deprecated in favour of the library's own terminal query, which leaves a reader
-                // thread behind when the terminal is silent. This program asks by itself instead.
-                #[allow(deprecated)]
-                let mut picker = Picker::from_fontsize(font);
-                picker.set_protocol_type(protocol);
-                Some(picker)
-            }
+            Method::Graphics(protocol) => Painter::picker(protocol, font),
             _ => None,
         };
         Painter {
             method,
             picker,
             font,
+            shrink: 1.0,
             reason,
             cache: RefCell::default(),
             requested: RefCell::default(),
@@ -302,7 +338,8 @@ impl Painter {
         let (fw, fh) = (f64::from(self.font.width), f64::from(self.font.height));
         let scale = (f64::from(available.width) * fw / w)
             .min(f64::from(available.height) * fh / h)
-            .min(2.0);
+            .min(2.0)
+            * self.shrink;
         let cols = ((w * scale / fw).round() as u16).clamp(1, available.width);
         let rows = ((h * scale / fh).round() as u16).clamp(1, available.height);
         Some(Size::new(cols, rows))
@@ -340,6 +377,7 @@ impl Painter {
         };
         match &*encoded {
             Encoded::Graphics(protocol) => Image::new(protocol).render(placed, buf),
+            Encoded::Jpeg { sequence, .. } => place_sequence(sequence, placed, buf),
             Encoded::Blocks { cells, size } => {
                 for (i, cell) in cells.iter().enumerate() {
                     let (x, y) = (i as u16 % size.width, i as u16 / size.width);
@@ -385,10 +423,13 @@ impl Painter {
     /// The largest picture worth decoding for a preview column of this many cells.
     pub fn decode_target(&self, columns: u16, rows: u16) -> (u32, u32) {
         match self.method {
-            Method::Graphics(_) => (
-                u32::from(columns) * u32::from(self.font.width),
-                u32::from(rows) * u32::from(self.font.height),
-            ),
+            Method::Graphics(_) => {
+                let font = self.encoded_font();
+                let px = |cells: u16, cell: u16| {
+                    (f64::from(cells) * f64::from(cell) * self.shrink) as u32
+                };
+                (px(columns, font.width), px(rows, font.height))
+            }
             // Two pixels a cell each way, and twice that so the smoothing filter has something to average.
             Method::Blocks(_) | Method::Off => (u32::from(columns) * 4, u32::from(rows) * 4),
         }
@@ -409,8 +450,12 @@ fn encode(
     match method {
         Method::Off => None,
         Method::Graphics(_) => {
+            let picker = picker?;
+            if picker.protocol_type() == ProtocolType::Iterm2 && !image.0.color().has_alpha() {
+                return encode_jpeg(picker, &image.0, size);
+            }
             let smooth = Resize::Scale(Some(FilterType::CatmullRom));
-            picker?
+            picker
                 .new_protocol((*image.0).clone(), size, smooth)
                 .ok()
                 .map(Encoded::Graphics)
@@ -419,6 +464,65 @@ fn encode(
             cells: encode_blocks(&image.0, size, kind),
             size,
         }),
+    }
+}
+
+/// An iTerm2 inline image as a JPEG. The library sends a PNG in absolute pixels, about a megabyte for
+/// a photo that fills the column, where a JPEG of the same picture is a tenth of that. Cell counts
+/// for the size let the terminal do the scaling, so the picture is never sent bigger than it is.
+fn encode_jpeg(picker: &Picker, image: &DynamicImage, size: Size) -> Option<Encoded> {
+    let font = picker.font_size();
+    let (max_w, max_h) = (
+        u32::from(size.width) * u32::from(font.width),
+        u32::from(size.height) * u32::from(font.height),
+    );
+    let rgb = if image.width() > max_w || image.height() > max_h {
+        image.resize(max_w, max_h, FilterType::CatmullRom).to_rgb8()
+    } else {
+        image.to_rgb8()
+    };
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 88)
+        .encode_image(&rgb)
+        .ok()?;
+    let (start, escape, end) = if picker.tmux_detected() {
+        ("\x1bPtmux;", "\x1b\x1b", "\x1b\\")
+    } else {
+        ("", "\x1b", "")
+    };
+    let mut sequence = String::from(start);
+    // Blank the cells first, the way the library does, so nothing shows through at the edges.
+    for _ in 0..size.height {
+        sequence.push_str(&format!("{escape}[{}X{escape}[1B", size.width));
+    }
+    sequence.push_str(&format!("{escape}[{}A", size.height));
+    sequence.push_str(&format!(
+        "{escape}]1337;File=inline=1;size={};width={};height={};preserveAspectRatio=0;doNotMoveCursor=1:",
+        jpeg.len(),
+        size.width,
+        size.height
+    ));
+    base64_simd::STANDARD.encode_append(&jpeg, &mut sequence);
+    sequence.push_str(&format!("\x07{end}"));
+    Some(Encoded::Jpeg { sequence, size })
+}
+
+/// Puts a terminal escape sequence in the top left cell and keeps the rest of the area from being
+/// written over it.
+fn place_sequence(sequence: &str, area: Rect, buf: &mut Buffer) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some(cell) = buf.cell_mut((x, y)) else {
+                continue;
+            };
+            if (x, y) == (area.left(), area.top()) {
+                let one = std::num::NonZeroU16::MIN;
+                cell.set_symbol(sequence)
+                    .set_diff_option(CellDiffOption::ForcedWidth(one));
+            } else {
+                cell.set_diff_option(CellDiffOption::Skip);
+            }
+        }
     }
 }
 
@@ -909,5 +1013,82 @@ mod tests {
             String::new(),
         );
         assert!(sixel.leaves_ghosts());
+    }
+
+    fn graphics(protocol: ProtocolType) -> Painter {
+        Painter::build(
+            Method::Graphics(protocol),
+            FontSize::new(10, 20),
+            String::new(),
+        )
+    }
+
+    fn sent(painter: &Painter, image: &ImageData, size: Size) -> Encoded {
+        let (_, encoded) = EncodeJob {
+            key: (PathBuf::new(), 0, size),
+            image: image.clone(),
+            size,
+            method: painter.method,
+            picker: painter.picker.clone(),
+        }
+        .run();
+        encoded.expect("encoded")
+    }
+
+    #[test]
+    fn iterm2_gets_a_small_jpeg_stretched_over_the_cells_by_the_terminal() {
+        let size = Size::new(20, 5);
+        let Encoded::Jpeg { sequence, .. } = sent(
+            &graphics(ProtocolType::Iterm2),
+            &ImageData(Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(
+                800, 400,
+            )))),
+            size,
+        ) else {
+            panic!("an opaque picture is sent as a JPEG");
+        };
+        assert!(sequence.contains("width=20;height=5;"), "{sequence:.200}");
+        let data = sequence
+            .rsplit_once(':')
+            .unwrap()
+            .1
+            .trim_end_matches('\x07');
+        let jpeg = base64_simd::STANDARD.decode_to_vec(data).unwrap();
+        let shown = image::load_from_memory(&jpeg).unwrap();
+        assert!(
+            shown.width() <= 200 && shown.height() <= 100,
+            "never more pixels than the cells hold: {}x{}",
+            shown.width(),
+            shown.height()
+        );
+    }
+
+    #[test]
+    fn a_picture_with_transparency_keeps_it_by_staying_a_png() {
+        let encoded = sent(
+            &graphics(ProtocolType::Iterm2),
+            &picture(40, 20),
+            Size::new(4, 1),
+        );
+        assert!(matches!(encoded, Encoded::Graphics(_)));
+    }
+
+    #[test]
+    fn kitty_is_sent_at_half_resolution_over_a_slow_link_and_full_otherwise() {
+        let local = graphics(ProtocolType::Kitty);
+        let remote = graphics(ProtocolType::Kitty).remote(true);
+        assert_eq!(local.decode_target(100, 50), (1000, 1000));
+        assert_eq!(remote.decode_target(100, 50), (500, 500));
+        assert_eq!(
+            remote.describe(),
+            local.describe(),
+            "the layout keeps the real cell size"
+        );
+        let sixel = graphics(ProtocolType::Sixel).remote(true);
+        assert_eq!(sixel.decode_target(100, 50), (600, 600), "sixel is drawn smaller");
+        let fitted = sixel
+            .fitted_size(&picture(1000, 1000), Size::new(100, 50))
+            .unwrap();
+        assert_eq!(fitted, Size::new(60, 30), "60% of the room, in cells");
     }
 }

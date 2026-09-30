@@ -195,8 +195,8 @@ mod tests {
     }
 
     fn nix_is_root() -> bool {
-        fs::metadata("/proc/self")
-            .map(|m| m.uid() == 0)
-            .unwrap_or(false)
+        // A fresh directory belongs to the effective user.
+        let dir = tempfile::tempdir().unwrap();
+        fs::metadata(dir.path()).is_ok_and(|m| m.uid() == 0)
     }
 }

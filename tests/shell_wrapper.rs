@@ -15,6 +15,8 @@ fn fake_tx(bin_dir: &Path) {
 
 fn run_in(shell: &str, kind: Shell, dest: Option<&Path>, exit: u8) -> (String, i32) {
     let tmp = tempfile::tempdir().unwrap();
+    // macOS temp dirs sit behind /var -> /private/var, which `pwd` resolves.
+    let real = tmp.path().canonicalize().unwrap();
     let bin = tmp.path().join("bin");
     fs::create_dir(&bin).unwrap();
     fake_tx(&bin);
@@ -54,7 +56,7 @@ fn run_in(shell: &str, kind: Shell, dest: Option<&Path>, exit: u8) -> (String, i
         .parse()
         .unwrap();
     let pwd = line.split("pwd=").nth(1).unwrap().to_string();
-    (pwd.replace(tmp.path().to_str().unwrap(), "<tmp>"), rc)
+    (pwd.replace(real.to_str().unwrap(), "<tmp>"), rc)
 }
 
 fn wrapper_case(shell: &str, kind: Shell) {
