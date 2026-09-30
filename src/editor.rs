@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use ratatui::crossterm::event::KeyCode;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
@@ -311,9 +312,56 @@ pub struct Editor {
     saved_version: u64,
     disk_key: PreviewKey,
     tab_text: &'static str,
-    highlight: Option<(u64, Vec<Line>)>,
+    highlight: Option<HighlightCache>,
     /// One-line notice for the footer, cleared by the next key.
     pub message: Option<String>,
+}
+
+struct HighlightCache {
+    version: u64,
+    lines: Vec<Line>,
+}
+
+impl HighlightCache {
+    fn patch_replace(&mut self, buf: &Buffer, start: Pos, end: Pos, text: &str) {
+        self.lines.truncate(HIGHLIGHT_LINES);
+        if start.line >= self.lines.len() {
+            return;
+        }
+
+        if start.line == end.line && !text.contains('\n') {
+            let line = &mut self.lines[start.line];
+            if line_has_text(line, buf.line(start.line)) {
+                patch_line(line, start.col, end.col, text);
+            }
+            return;
+        }
+
+        let old_end = end.line.saturating_add(1);
+        let affected_is_current = old_end <= self.lines.len()
+            && self.lines[start.line..old_end]
+                .iter()
+                .enumerate()
+                .all(|(offset, line)| line_has_text(line, buf.line(start.line + offset)));
+        let inserted = text.matches('\n').count() + 1;
+        let room = HIGHLIGHT_LINES - start.line;
+        let replacement = if affected_is_current {
+            patch_lines(&self.lines[start.line..old_end], start, end, text, room)
+        } else {
+            std::iter::repeat_with(Line::default)
+                .take(inserted.min(room))
+                .collect()
+        };
+
+        if inserted >= room {
+            self.lines.truncate(start.line);
+            self.lines.extend(replacement);
+        } else {
+            let cached_end = old_end.min(self.lines.len());
+            self.lines.splice(start.line..cached_end, replacement);
+            self.lines.truncate(HIGHLIGHT_LINES);
+        }
+    }
 }
 
 impl Editor {
@@ -418,12 +466,12 @@ impl Editor {
         self.buf.line(index)
     }
 
-    /// Syntax colors for a line. A line changed since the colors were made shows plain until the next refresh.
+    /// Syntax colors for a line. A changed line keeps provisional colors until the next refresh.
     pub fn styled_line(&self, index: usize) -> Line {
         let text = self.buf.line(index);
-        if let Some((_, lines)) = &self.highlight
-            && let Some(line) = lines.get(index)
-            && line.text() == text
+        if let Some(highlight) = &self.highlight
+            && let Some(line) = highlight.lines.get(index)
+            && line_has_text(line, text)
         {
             return line.clone();
         }
@@ -439,7 +487,7 @@ impl Editor {
     pub fn highlight_stale(&self) -> bool {
         self.highlight
             .as_ref()
-            .is_none_or(|(version, _)| *version != self.buf.version())
+            .is_none_or(|highlight| highlight.version != self.buf.version())
     }
 
     /// Recomputes syntax colors down to the bottom of the view.
@@ -453,7 +501,23 @@ impl Editor {
             .min(HIGHLIGHT_LINES);
         let mut lines = preview::highlight(&self.buf.lines()[..shown], &self.path);
         lines.truncate(shown);
-        self.highlight = Some((self.buf.version(), lines));
+        self.highlight = Some(HighlightCache {
+            version: self.buf.version(),
+            lines,
+        });
+    }
+
+    /// Makes an edit look styled immediately, while leaving the cache stale for Syntect.
+    fn replace(&mut self, start: Pos, end: Pos, text: &str) -> Pos {
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        if let Some(highlight) = &mut self.highlight {
+            highlight.patch_replace(&self.buf, start, end, text);
+        }
+        self.buf.replace(start, end, text)
     }
 
     /// Takes the text of the file again after `:e!`, keeping the cursor where it can stay.
@@ -588,11 +652,11 @@ impl Editor {
             ToggleCase => self.toggle_case(n),
             PasteAfter => self.put(true, n),
             PasteBefore => self.put(false, n),
-            Undo => match self.buf.undo() {
+            Undo => match self.undo() {
                 Some(cursor) => self.cursor = cursor,
                 None => self.message = Some("nothing to undo".into()),
             },
-            Redo => match self.buf.redo() {
+            Redo => match self.redo() {
                 Some(cursor) => self.cursor = cursor,
                 None => self.message = Some("nothing to redo".into()),
             },
@@ -622,6 +686,24 @@ impl Editor {
             _ => {}
         }
         None
+    }
+
+    fn undo(&mut self) -> Option<Pos> {
+        let highlight = &mut self.highlight;
+        self.buf.undo_with(|buf, start, end, text| {
+            if let Some(highlight) = highlight {
+                highlight.patch_replace(buf, start, end, text);
+            }
+        })
+    }
+
+    fn redo(&mut self) -> Option<Pos> {
+        let highlight = &mut self.highlight;
+        self.buf.redo_with(|buf, start, end, text| {
+            if let Some(highlight) = highlight {
+                highlight.patch_replace(buf, start, end, text);
+            }
+        })
     }
 
     /// The selection as its first and last position, inclusive, and whether it is whole lines.
@@ -734,7 +816,7 @@ impl Editor {
                         _ => ch.to_lowercase().collect(),
                     })
                     .collect();
-                self.buf.replace(range.start, range.end, &changed);
+                self.replace(range.start, range.end, &changed);
                 self.cursor = range.start;
             }
             Join => {
@@ -754,7 +836,7 @@ impl Editor {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                self.buf.replace(range.start, range.end, &replaced);
+                self.replace(range.start, range.end, &replaced);
                 self.cursor = range.start;
             }
             PasteAfter | PasteBefore => {
@@ -770,7 +852,7 @@ impl Editor {
                     (false, true) => register.text.clone(),
                     (false, false) => register.text.clone(),
                 };
-                self.buf.replace(range.start, range.end, &text);
+                self.replace(range.start, range.end, &text);
                 self.cursor = range.start;
                 self.register = Some(Register {
                     text: deleted,
@@ -1047,7 +1129,7 @@ impl Editor {
                     text,
                     linewise: range.linewise,
                 });
-                self.buf.replace(range.start, range.end, "");
+                self.replace(range.start, range.end, "");
                 self.cursor = range.start;
                 self.mode = Mode::Insert;
             }
@@ -1056,21 +1138,20 @@ impl Editor {
 
     fn delete(&mut self, range: Range) {
         if !range.linewise {
-            self.buf.replace(range.start, range.end, "");
+            self.replace(range.start, range.end, "");
             self.cursor = self.buf.clamp(range.start, false);
             return;
         }
         let (first, last) = (range.start.line, range.end.line);
         let count = self.buf.line_count();
         if first == 0 && last + 1 >= count {
-            self.buf.replace(Pos::new(0, 0), range.end, "");
+            self.replace(Pos::new(0, 0), range.end, "");
             self.buf.mark_emptied();
         } else if last + 1 < count {
-            self.buf
-                .replace(Pos::new(first, 0), Pos::new(last + 1, 0), "");
+            self.replace(Pos::new(first, 0), Pos::new(last + 1, 0), "");
         } else {
             let above = first - 1;
-            self.buf.replace(
+            self.replace(
                 Pos::new(above, self.buf.line_len(above)),
                 Pos::new(last, self.buf.line_len(last)),
                 "",
@@ -1096,7 +1177,7 @@ impl Editor {
             } else {
                 (Pos::new(line, 0), format!("{block}\n"), line)
             };
-            self.buf.replace(at, at, &text);
+            self.replace(at, at, &text);
             self.cursor = Pos::new(first, editmotion::first_non_blank(&self.buf, first));
             return;
         }
@@ -1106,7 +1187,7 @@ impl Editor {
         } else {
             self.cursor
         };
-        let end = self.buf.replace(at, at, &text);
+        let end = self.replace(at, at, &text);
         self.cursor = if text.contains('\n') {
             at
         } else {
@@ -1121,11 +1202,11 @@ impl Editor {
         let indent_cols = grapheme_len(&indent);
         if below {
             let at = Pos::new(line, self.buf.line_len(line));
-            self.buf.replace(at, at, &format!("\n{indent}"));
+            self.replace(at, at, &format!("\n{indent}"));
             self.cursor = Pos::new(line + 1, indent_cols);
         } else {
             let at = Pos::new(line, 0);
-            self.buf.replace(at, at, &format!("{indent}\n"));
+            self.replace(at, at, &format!("{indent}\n"));
             self.cursor = Pos::new(line, indent_cols);
         }
         self.mode = Mode::Insert;
@@ -1137,7 +1218,7 @@ impl Editor {
             return;
         }
         let end = Pos::new(c.line, c.col + n);
-        self.buf.replace(c, end, &ch.to_string().repeat(n));
+        self.replace(c, end, &ch.to_string().repeat(n));
         self.cursor = Pos::new(c.line, c.col + n - 1);
     }
 
@@ -1160,8 +1241,7 @@ impl Editor {
                 " "
             };
             let len = grapheme_len(&current);
-            self.buf
-                .replace(Pos::new(line, len), Pos::new(line + 1, skipped), glue);
+            self.replace(Pos::new(line, len), Pos::new(line + 1, skipped), glue);
             self.cursor = Pos::new(line, len);
         }
     }
@@ -1185,7 +1265,7 @@ impl Editor {
                 }
             })
             .collect();
-        self.buf.replace(c, end, &swapped);
+        self.replace(c, end, &swapped);
         self.cursor = Pos::new(c.line, end.col);
     }
 
@@ -1277,9 +1357,9 @@ impl Editor {
             (KeyCode::Delete, _) => {
                 let len = self.buf.line_len(c.line);
                 if c.col < len {
-                    self.buf.replace(c, Pos::new(c.line, c.col + 1), "");
+                    self.replace(c, Pos::new(c.line, c.col + 1), "");
                 } else if c.line + 1 < self.buf.line_count() {
-                    self.buf.replace(c, Pos::new(c.line + 1, 0), "");
+                    self.replace(c, Pos::new(c.line + 1, 0), "");
                 }
             }
             (KeyCode::Char('w'), true) => {
@@ -1292,12 +1372,12 @@ impl Editor {
                     } else {
                         Pos::new(c.line, 0)
                     };
-                    self.buf.replace(start, c, "");
+                    self.replace(start, c, "");
                     self.cursor = start;
                 }
             }
             (KeyCode::Char('u'), true) => {
-                self.buf.replace(Pos::new(c.line, 0), c, "");
+                self.replace(Pos::new(c.line, 0), c, "");
                 self.cursor = Pos::new(c.line, 0);
             }
             (KeyCode::Left, _) => self.cursor.col = c.col.saturating_sub(1),
@@ -1324,18 +1404,18 @@ impl Editor {
     }
 
     fn insert(&mut self, text: &str) {
-        self.cursor = self.buf.replace(self.cursor, self.cursor, text);
+        self.cursor = self.replace(self.cursor, self.cursor, text);
     }
 
     fn backspace(&mut self) {
         let c = self.cursor;
         if c.col > 0 {
             let start = Pos::new(c.line, c.col - 1);
-            self.buf.replace(start, c, "");
+            self.replace(start, c, "");
             self.cursor = start;
         } else if c.line > 0 {
             let above = Pos::new(c.line - 1, self.buf.line_len(c.line - 1));
-            self.buf.replace(above, c, "");
+            self.replace(above, c, "");
             self.cursor = above;
         }
     }
@@ -1347,6 +1427,147 @@ impl Editor {
         self.cursor = self.buf.clamp(self.cursor, false);
         self.want_col = self.cursor.col;
     }
+}
+
+#[derive(Clone, Copy)]
+struct SpanStyle {
+    color: preview::Rgb,
+    bold: bool,
+    italic: bool,
+}
+
+impl SpanStyle {
+    fn span(self, text: impl Into<String>) -> preview::Span {
+        preview::Span {
+            text: text.into(),
+            color: self.color,
+            bold: self.bold,
+            italic: self.italic,
+        }
+    }
+}
+
+fn line_has_text(line: &Line, text: &str) -> bool {
+    let mut rest = text;
+    for span in &line.0 {
+        let Some(after) = rest.strip_prefix(&span.text) else {
+            return false;
+        };
+        rest = after;
+    }
+    rest.is_empty()
+}
+
+fn patch_line(line: &mut Line, start: usize, end: usize, text: &str) {
+    let inherited = if start < end {
+        style_at(line, start)
+    } else {
+        style_at(line, start.saturating_sub(1)).or_else(|| style_at(line, start))
+    }
+    .unwrap_or(SpanStyle {
+        color: crate::theme::FG,
+        bold: false,
+        italic: false,
+    });
+    let mut spans = spans_in_range(line, 0, start);
+    if !text.is_empty() {
+        spans.push(inherited.span(text));
+    }
+    spans.extend(spans_in_range(line, end, usize::MAX));
+    line.0 = coalesce_spans(spans);
+}
+
+fn patch_lines(affected: &[Line], start: Pos, end: Pos, text: &str, limit: usize) -> Vec<Line> {
+    let first = &affected[0];
+    let last = affected.last().unwrap_or(first);
+    let inherited = if start < end {
+        style_at(first, start.col)
+    } else {
+        style_at(first, start.col.saturating_sub(1)).or_else(|| style_at(first, start.col))
+    }
+    .unwrap_or(SpanStyle {
+        color: crate::theme::FG,
+        bold: false,
+        italic: false,
+    });
+    let prefix = spans_in_range(first, 0, start.col);
+    let suffix = spans_in_range(last, end.col, usize::MAX);
+    let count = text.matches('\n').count() + 1;
+    let mut lines = Vec::with_capacity(count.min(limit));
+
+    for (index, part) in text.split('\n').take(limit).enumerate() {
+        let mut spans = if index == 0 {
+            prefix.clone()
+        } else {
+            Vec::new()
+        };
+        if !part.is_empty() {
+            spans.push(inherited.span(part));
+        }
+        if index + 1 == count {
+            spans.extend(suffix.clone());
+        }
+        lines.push(Line(coalesce_spans(spans)));
+    }
+    lines
+}
+
+fn style_at(line: &Line, col: usize) -> Option<SpanStyle> {
+    let mut start = 0;
+    for span in &line.0 {
+        let end = start + grapheme_len(&span.text);
+        if col < end {
+            return Some(SpanStyle {
+                color: span.color,
+                bold: span.bold,
+                italic: span.italic,
+            });
+        }
+        start = end;
+    }
+    None
+}
+
+fn spans_in_range(line: &Line, start: usize, end: usize) -> Vec<preview::Span> {
+    let mut offset = 0;
+    let mut out = Vec::new();
+    for span in &line.0 {
+        let width = grapheme_len(&span.text);
+        let span_end = offset + width;
+        let from = start.max(offset);
+        let to = end.min(span_end);
+        if from < to {
+            out.push(preview::Span {
+                text: span
+                    .text
+                    .graphemes(true)
+                    .skip(from - offset)
+                    .take(to - from)
+                    .collect(),
+                color: span.color,
+                bold: span.bold,
+                italic: span.italic,
+            });
+        }
+        offset = span_end;
+    }
+    out
+}
+
+fn coalesce_spans(spans: Vec<preview::Span>) -> Vec<preview::Span> {
+    let mut out: Vec<preview::Span> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if let Some(previous) = out.last_mut()
+            && previous.color == span.color
+            && previous.bold == span.bold
+            && previous.italic == span.italic
+        {
+            previous.text.push_str(&span.text);
+        } else {
+            out.push(span);
+        }
+    }
+    out
 }
 
 fn is_blank_at(buf: &Buffer, pos: Pos) -> bool {
@@ -2069,7 +2290,7 @@ mod tests {
     }
 
     #[test]
-    fn styled_lines_use_syntax_colors_once_refreshed_and_plain_text_before() {
+    fn styled_lines_use_syntax_colors_once_refreshed_and_while_editing() {
         let mut e = Editor::open("a.rs".into(), b"fn main() {}\n", (0, None)).unwrap();
         assert_eq!(
             e.styled_line(0).0.len(),
@@ -2082,14 +2303,93 @@ mod tests {
             "keywords and names split into spans"
         );
         keys(&mut e, "x");
+        let provisional = e.styled_line(0);
         assert_eq!(
-            e.styled_line(0).0.len(),
-            1,
-            "a changed line is plain until the refresh"
+            provisional.text(),
+            "n main() {}",
+            "the edited text is shown"
+        );
+        assert!(
+            provisional.0.len() > 1,
+            "an edited line keeps its provisional syntax spans"
         );
         assert!(e.highlight_stale());
         e.refresh_highlight();
         assert!(e.styled_line(0).0.len() > 1);
+    }
+
+    #[test]
+    fn joining_lines_keeps_cached_styles_below_the_join() {
+        let mut e = Editor::open(
+            "a.rs".into(),
+            b"fn one() {}\nfn two() {}\nfn three() {}\n",
+            (0, None),
+        )
+        .unwrap();
+        e.refresh_highlight();
+
+        keys(&mut e, "J");
+
+        let below = e.styled_line(1);
+        assert_eq!(below.text(), "fn three() {}");
+        assert!(
+            below.0.len() > 1,
+            "the line moved up by the join keeps its cached syntax spans"
+        );
+        assert!(e.highlight_stale());
+    }
+
+    #[test]
+    fn undoing_a_join_keeps_cached_styles_below_the_restored_lines() {
+        let mut e = Editor::open(
+            "a.rs".into(),
+            b"fn one() {}\nfn two() {}\nfn three() {}\n",
+            (0, None),
+        )
+        .unwrap();
+        e.refresh_highlight();
+
+        keys(&mut e, "Ju");
+
+        let restored = e.styled_line(1);
+        assert_eq!(restored.text(), "fn two() {}");
+        assert!(
+            restored.0.len() > 1,
+            "a line restored by undo keeps its cached syntax spans"
+        );
+        assert!(e.highlight_stale());
+    }
+
+    #[test]
+    fn undo_and_redo_patch_a_cache_refreshed_after_the_edit() {
+        let mut e = Editor::open(
+            "a.rs".into(),
+            b"fn one() {}\nfn two() {}\nfn three() {}\n",
+            (0, None),
+        )
+        .unwrap();
+        e.refresh_highlight();
+        keys(&mut e, "J");
+        e.refresh_highlight();
+
+        keys(&mut e, "u");
+        assert_eq!(e.styled_line(1).text(), "fn two() {}");
+        assert!(e.styled_line(1).0.len() > 1);
+
+        keys(&mut e, "<c-r>");
+        assert_eq!(e.styled_line(1).text(), "fn three() {}");
+        assert!(e.styled_line(1).0.len() > 1);
+    }
+
+    #[test]
+    fn provisional_highlight_never_grows_past_its_line_limit() {
+        let mut e = Editor::open("a.rs".into(), b"fn main() {}\n", (0, None)).unwrap();
+        e.refresh_highlight();
+        keys(&mut e, "i");
+
+        e.insert(&"\n".repeat(HIGHLIGHT_LINES + 10));
+
+        assert!(e.highlight.as_ref().unwrap().lines.len() <= HIGHLIGHT_LINES);
     }
 
     /// Feeds thousands of random keys and checks that nothing panics and the cursor stays on the text.
@@ -2119,9 +2419,13 @@ mod tests {
             let mut rng = Rng(seed);
             let mut e = ed(ORIGINAL);
             e.set_rows(6);
-            for _ in 0..400 {
+            e.refresh_highlight();
+            for step in 0..400 {
                 let key = KEYS[rng.next(KEYS.len())];
                 keys(&mut e, key);
+                if step % 17 == 0 {
+                    e.refresh_highlight();
+                }
                 let c = e.cursor();
                 assert!(c.line < e.line_count(), "seed {seed} after {key}");
                 let len = grapheme_len(e.line_text(c.line));
@@ -2139,10 +2443,11 @@ mod tests {
                     "seed {seed} after {key}"
                 );
                 assert!(String::from_utf8(e.bytes()).is_ok());
+                assert!(e.highlight.as_ref().unwrap().lines.len() <= HIGHLIGHT_LINES);
             }
             keys(&mut e, "<esc>");
             let mut undone = 0;
-            while e.buf.undo().is_some() {
+            while e.undo().is_some() {
                 undone += 1;
                 assert!(undone < 100_000);
             }
