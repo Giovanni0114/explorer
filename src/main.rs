@@ -61,19 +61,19 @@ fn main() -> io::Result<()> {
         images,
         ImageMode::Off | ImageMode::Blocks | ImageMode::Halfblocks
     );
+    let over_ssh =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
     let answers = if asks {
         let in_tmux = std::env::var_os("TMUX").is_some();
         // Over SSH the answers cross the network. Reading stops at the DA1 answer anyway, so a longer
         // limit only costs time with a terminal that never answers, and an answer arriving after the
         // limit would be read as keystrokes.
-        let over_ssh =
-            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
         let limit = if over_ssh { 2000 } else { 500 };
         termquery::ask(in_tmux, std::time::Duration::from_millis(limit)).ok()
     } else {
         None
     };
-    let painter = Painter::new(images, answers.as_ref());
+    let painter = Painter::new(images, answers.as_ref()).remote(over_ssh);
     let screen = terminal.size()?;
     // Pictures only ever fill the preview column, which gets what the folder columns leave.
     let preview_columns =

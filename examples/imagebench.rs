@@ -51,6 +51,14 @@ fn main() {
             "sixel",
             tx::imageview::Painter::new(tx::imageview::Mode::Sixel, None),
         ),
+        (
+            "kitty",
+            tx::imageview::Painter::new(tx::imageview::Mode::Kitty, None),
+        ),
+        (
+            "iterm2",
+            tx::imageview::Painter::new(tx::imageview::Mode::Iterm2, None),
+        ),
     ] {
         let (w, h) = painter.decode_target(screen.0 / 2, screen.1 - 2);
         tx::preview::set_image_target(w, h);
