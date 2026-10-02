@@ -84,6 +84,7 @@ impl Session {
             "ITERM_SESSION_ID",
             "KITTY_WINDOW_ID",
             "WEZTERM_EXECUTABLE",
+            "TMUX",
         ] {
             cmd.env_remove(name);
         }

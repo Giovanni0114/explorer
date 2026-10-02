@@ -1052,6 +1052,7 @@ mod tests {
             .rsplit_once(':')
             .unwrap()
             .1
+            .trim_end_matches("\x1b\\")
             .trim_end_matches('\x07');
         let jpeg = base64_simd::STANDARD.decode_to_vec(data).unwrap();
         let shown = image::load_from_memory(&jpeg).unwrap();
