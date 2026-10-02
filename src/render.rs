@@ -1455,6 +1455,35 @@ mod tests {
         img.save(path).unwrap();
     }
 
+    #[cfg(feature = "pdf")]
+    fn write_pdf(path: &std::path::Path) {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 50] /Contents 4 0 R >>",
+            "<< /Length 27 >>\nstream\n1 0 0 rg 0 0 100 50 re f\nendstream",
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (number, object) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", number + 1).as_bytes());
+        }
+        let xref = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn a_picture_is_drawn_in_the_preview_with_its_card_under_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1502,6 +1531,31 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("image/png")));
         assert!(
             !lines.iter().any(|l| l.contains('▀') || l.contains('▄')),
+            "{lines:#?}"
+        );
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn with_images_off_a_pdf_shows_metadata_without_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pdf(&tmp.path().join("page.pdf"));
+        let mut app = App::with_settings(
+            tmp.path().to_path_buf(),
+            Keymap::default(),
+            crate::app::Settings {
+                painter: crate::imageview::Painter::off(),
+                ..Default::default()
+            },
+        );
+        app.settle();
+        let (lines, _) = rows(&app, 100, 15);
+        assert!(
+            lines.iter().any(|line| line.contains("PDF · page 1 of 1")),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains('▀') || line.contains('▄')),
             "{lines:#?}"
         );
     }

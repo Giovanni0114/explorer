@@ -17,6 +17,8 @@ pub mod model;
 pub mod motion;
 pub mod ops;
 pub mod preview;
+#[cfg(feature = "pdf")]
+pub(crate) mod pdfpreview;
 pub mod prompt;
 pub mod render;
 pub mod runtime;

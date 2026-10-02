@@ -126,6 +126,32 @@ pub fn build(path: &Path) -> io::Result<Content> {
         .take(HEAD_BYTES as u64)
         .read_to_end(&mut head)?;
     let cut = meta.len() > head.len() as u64;
+    if is_pdf(&head) {
+        #[cfg(not(feature = "pdf"))]
+        return Ok(Content::message(
+            "PDF preview requires a build with the pdf feature",
+        ));
+        #[cfg(feature = "pdf")]
+        {
+            if meta.len() > MAX_IMAGE_BYTES {
+                let mut content = binary_content(&head, cut, &meta);
+                content
+                    .lines
+                    .insert(0, Line::dim("PDF is too large to preview"));
+                return Ok(content);
+            }
+            return match crate::pdfpreview::render_first_page(path, image_target()) {
+                Ok(rendered) => Ok(pdf_content(&meta, rendered)),
+                Err(reason) => {
+                    let mut content = binary_content(&head, cut, &meta);
+                    content
+                        .lines
+                        .insert(0, Line::dim(format!("cannot show the PDF: {reason}")));
+                    Ok(content)
+                }
+            };
+        }
+    }
     if looks_like_text(&head, cut) {
         return Ok(text_content(&head, cut, meta.len(), path));
     }
@@ -143,6 +169,11 @@ pub fn build(path: &Path) -> io::Result<Content> {
         }
     }
     Ok(binary_content(&head, cut, &meta))
+}
+
+fn is_pdf(head: &[u8]) -> bool {
+    head.starts_with(b"%PDF-")
+        || infer::get(head).is_some_and(|kind| kind.mime_type() == "application/pdf")
 }
 
 fn text_content(head: &[u8], cut: bool, total: u64, path: &Path) -> Content {
@@ -498,6 +529,21 @@ fn image_content(head: &[u8], meta: &fs::Metadata, image: ImageData) -> Content 
     }
 }
 
+#[cfg(feature = "pdf")]
+fn pdf_content(meta: &fs::Metadata, rendered: crate::pdfpreview::RenderedPdf) -> Content {
+    Content {
+        image: Some(rendered.image),
+        lines: vec![Line::dim(format!(
+            "PDF · page 1 of {} · {}×{} pt · {}",
+            rendered.page_count,
+            rendered.page_size_points.0,
+            rendered.page_size_points.1,
+            human_size(meta.len())
+        ))],
+        numbered: false,
+    }
+}
+
 fn binary_content(head: &[u8], cut: bool, meta: &fs::Metadata) -> Content {
     let mut lines = vec![
         card("type", &describe_type(head)),
@@ -717,6 +763,47 @@ mod tests {
         content.lines.iter().map(Line::text).collect()
     }
 
+    #[cfg(feature = "pdf")]
+    fn pdf_document(objects: &[String]) -> Vec<u8> {
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (number, object) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", number + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    #[cfg(feature = "pdf")]
+    fn two_page_pdf() -> Vec<u8> {
+        let stream = |contents: &str| {
+            format!(
+                "<< /Length {} >>\nstream\n{contents}\nendstream",
+                contents.len()
+            )
+        };
+        pdf_document(&[
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 50] /Contents 5 0 R >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 50] /Contents 6 0 R >>".into(),
+            stream("1 0 0 rg 0 0 100 50 re f"),
+            stream("0 0 1 rg 0 0 100 50 re f"),
+        ])
+    }
+
     #[test]
     fn source_files_are_numbered_and_syntax_colored() {
         let (_t, path) = file("main.rs", b"fn main() {\n    let x = 1; // hi\n}\n");
@@ -745,6 +832,70 @@ mod tests {
                 .iter()
                 .flat_map(|l| &l.0)
                 .all(|s| s.color != (0, 0, 0))
+        );
+    }
+
+    #[cfg(not(feature = "pdf"))]
+    #[test]
+    fn pdfs_are_recognized_before_text_and_explain_how_to_enable_preview() {
+        let (_t, path) = file("document.txt", b"%PDF-1.7\nplain ASCII PDF body\n");
+        let content = build(&path).unwrap();
+        assert_eq!(
+            text(&content),
+            ["PDF preview requires a build with the pdf feature"]
+        );
+        assert!(!content.numbered);
+        assert!(content.image.is_none());
+
+        let (_t, path) = file("notes.txt", b"plain ASCII text\n");
+        assert!(build(&path).unwrap().numbered);
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn pdfs_render_a_first_page_with_metadata() {
+        let (_t, path) = file("document.txt", &two_page_pdf());
+        let content = with_target(40, 40, || build(&path).unwrap());
+        assert!(content.image.is_some());
+        assert!(!content.numbered);
+        assert!(
+            text(&content)
+                .iter()
+                .any(|line| line.contains("PDF · page 1 of 2")),
+            "{:?}",
+            text(&content)
+        );
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn broken_pdfs_fall_back_to_the_binary_card_with_a_reason() {
+        let (_t, path) = file("broken.pdf", b"%PDF-1.4\nnot a document");
+        let content = build(&path).unwrap();
+        assert!(content.image.is_none());
+        let lines = text(&content);
+        assert!(lines[0].starts_with("cannot show the PDF:"), "{lines:?}");
+        assert!(lines.iter().any(|line| line.starts_with("type")), "{lines:?}");
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn oversize_pdfs_are_not_read_or_rendered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("large.pdf");
+        fs::write(&path, b"%PDF-1.4\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_IMAGE_BYTES + 1)
+            .unwrap();
+        let content = build(&path).unwrap();
+        assert!(content.image.is_none());
+        assert!(
+            text(&content)[0].starts_with("PDF is too large to preview"),
+            "{:?}",
+            text(&content)
         );
     }
 
